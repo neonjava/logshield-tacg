@@ -1,31 +1,42 @@
 # LogShield TACG
 
-**AI26CY03 · Log-Based Intrusion Detection · Rust security engine**
+**AI26CY03 — Log-Based Intrusion Detection**
 
-LogShield reconstructs an attack story from weak log events that a single-event rule might miss. Its Temporal Attack Correlation Graph (TACG) links events by source, account, host, service, time and security-relevant transitions. The result is an incident with a visible chain, a reproducible score, recommended actions and simulated response verification.
+LogShield is a local defensive monitoring system. Three controlled Rust applications receive real HTTP requests through a Rust gateway and write structured authentication logs. A read-only Rust sensor follows those files, normalizes each line, and sends events to the existing Temporal Attack Correlation Graph (TACG). The graph correlates source, account, host, service, time and event transitions. Incidents include real log evidence and an explicit risk breakdown. When a high-confidence lab incident reaches risk 85, the Rust response engine applies a real denylist entry at the lab gateway and asks the lab client to retry. **Only a matching HTTP 403 marks the incident `CONTAINED`.**
 
-## Why Rust
+The system never scans or attacks outside its fixed local lab. It never changes the host firewall. The only allowed targets are `app-a`, `app-b` and `app-c` on isolated Docker networks.
 
-The entire security pipeline and API are native Rust. Memory safety, strong types, predictable performance, Tokio concurrency and low runtime overhead fit a long-running monitoring agent. React only renders data returned by the Rust engine.
+## Why it matters
+
+Five failures from one source can be spread as 2 on A, 2 on B and 1 on C. Each host stays below a five-failure rule, yet the same identity and account across three hosts within a short interval forms an actionable pattern. TACG reconstructs that pattern and exposes its evidence. See [the real-world problem](docs/REAL_WORLD_PROBLEM.md) and [algorithm](docs/TACG.md).
 
 ## Architecture
 
-`log files / JSON / demo → Axum API → Tokio mpsc → Rust normalizer → TACG → risk and incident engine → simulated response → verification → SQLite → WebSocket / REST → React`
+```text
+fixed Rust lab client → Rust gateway → Rust apps → JSON log files
+                                               ↓
+read-only Rust sensor → normalizer → TACG → incident → SQLite
+                                         ↓
+                    response engine → gateway block → lab retry
+                                                       ↓
+                                    HTTP 403 → CONTAINED
+                                    HTTP 401 → RESPONSE_FAILED
+```
 
-See [architecture](docs/ARCHITECTURE.md) and [algorithm](docs/TACG.md).
+All security processing, services, database access, API and WebSocket are Rust. React only presents evidence. Rust provides memory safety, strong types, predictable performance, Tokio concurrency and low runtime overhead for a future long-running agent. See [architecture](docs/ARCHITECTURE.md).
 
-## Quick start
+## Requirements and startup
 
-Requires stable Rust, Node 22+ and npm.
-
-Terminal 1:
+The supplied fast Docker image packages **host-built Fedora 44 x86-64 Rust binaries** into a Fedora 44 runtime. This matches the current local development machine. Install stable Rust, Docker with the Compose plugin, Node 22+ and npm. For another host OS, build inside a compatible Linux environment or adapt the Dockerfile.
 
 ```bash
 cd /home/neonjava/logshield
-cargo run -p logshield-api
+cargo build --release -p logshield-api -p logshield-lab
+docker compose build
+docker compose up -d
 ```
 
-Terminal 2:
+In a second terminal:
 
 ```bash
 cd /home/neonjava/logshield/frontend
@@ -33,52 +44,64 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173>. The API listens only on `127.0.0.1:3000`. SQLite is created at `logshield.db` in the backend process working directory. For a clean demo, stop the backend and remove that local demo database before restarting.
+Open **http://127.0.0.1:5173**. The API is published only on `127.0.0.1:3000`; gateway, apps and client have no host ports. Lab traffic uses three `internal: true` networks. A separate ingress bridge connects only the API to the localhost dashboard. Application logs and SQLite live in named volumes. To stop: `docker compose down`. `docker compose down` retains named volumes. Use the Lab page's **Clear lab data** to reset incidents, events and the gateway denylist while retaining raw log files; the sensor skips old lines after reset.
 
-## Demo scenarios
+## Pages
 
-- **Normal:** benign logins, requests and service activity; no incident.
-- **Brute force:** eight failures on one host; incident and alert.
-- **Distributed low and slow:** two failures on server A, two on B and one on C from the same source. Individually weak events become one cross-host incident.
-- **Multi-stage:** connection → port activity → failures → successful login → privilege action → outbound activity. Critical incident, automatic simulated response, verification and containment.
+- **Overview:** gateway, sensor, TACG, database and service health; event rate, last event, open incidents and verified responses.
+- **Incidents:** real event timeline, clickable graph entities, per-host threshold comparison, reasons, exact score contributions and gateway proof trail.
+- **Events:** normalized event table. Click a row for the raw line, normalized fields, graph links and incident membership.
+- **Entities:** source, destination, host, account and service inventory from persisted logs.
+- **Responses:** gateway action and verification ledger.
+- **Lab:** fixed normal, distributed and multi-stage tests, forced response failure, and lab reset.
 
-Use the four dashboard buttons, or `curl -X POST http://127.0.0.1:3000/api/demo/multistage`. The exact [two-minute script](docs/DEMO.md) is presentation ready.
+## Demo paths
 
-## Risk and response
+- **Normal:** three valid dummy logins; no critical incident.
+- **Distributed:** five invalid logins as 2/2/1 across A/B/C from `attacker-lab`, username `demo`. TACG detects the cross-host attack, risk exceeds 85, and the gateway blocks the source for 60 seconds. The client retries and receives HTTP 403.
+- **Multi-stage:** two failed logins, successful dummy login, intentional lab admin operation and local outbound-style operation. These are safe endpoints, not vulnerabilities.
+- **Force response failure:** gateway refuses the block (HTTP 503); the client retries and receives HTTP 401 from the app, proving the request got through. Incident remains `RESPONSE_FAILED` and calls for human intervention.
 
-Six normalized features contribute 20, 20, 15, 20, 10 and 15 possible points respectively: rarity, temporal proximity, entity relationship, risky transitions, cross-host behavior and baseline deviation. A visible chain bonus is added and the total is capped at 100. The incident detail shows each contribution and every contributing event. Thresholds: low 0–39, medium 40–69, high 70–84, critical 85–100.
-
-Critical response is a **simulation only**: a source block and quarantine are recorded as simulated actions, evidence IDs are preserved and verification checks for new suspicious events after the response. No firewall, account or external system is modified. If activity continues, the incident becomes `RESPONSE_FAILED` and simulated escalation is recorded. This is a prototype observation window, not proof of real-world containment.
+The demo client never inserts an event directly into TACG. Its only scenario inputs are fixed requests through the gateway. See the exact [two-minute script](docs/DEMO.md).
 
 ## API
 
-| Method | Endpoint | Purpose |
+| Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/events` | Submit a normalized JSON security event |
-| POST | `/api/logs/upload` | Upload UTF-8 `.log`, `.txt`, or `.jsonl`, max 1 MiB |
-| GET | `/api/events` | Recent events |
-| GET | `/api/incidents` | Incidents |
-| GET | `/api/incidents/{id}` | Full chain and score |
-| GET | `/api/stats` | Dashboard totals |
-| POST | `/api/demo/{normal,bruteforce,distributed,multistage}` | Generate local data |
-| POST | `/api/incidents/{id}/respond` | Simulate and verify response |
-| GET | `/api/incidents/{id}/response` | Response status |
-| WS | `/ws/events` | Live event and incident notices |
+| GET | `/api/status` | Operational health and event rate |
+| GET | `/api/stats` | Persisted counts |
+| GET | `/api/events` | Recent normalized events |
+| POST | `/api/events` | Accept a normalized event from a trusted local integration |
+| POST | `/api/logs/upload` | Import UTF-8 `.log`, `.txt`, `.jsonl` up to 1 MiB |
+| GET | `/api/entities` | Observed entities |
+| GET | `/api/incidents`, `/api/incidents/{id}` | Incident queue and evidence |
+| GET | `/api/incidents/{id}/response`, `/api/responses` | Response and HTTP verification |
+| POST | `/api/lab/run/{normal,distributed,multistage}` | Ask the fixed lab client to send real requests |
+| POST | `/api/lab/force-failure` | Lab-only `{ "enabled": true }` |
+| POST | `/api/lab/clear` | Reset lab records and gateway block |
+| WS | `/ws/events` | Live event and incident notifications |
 
-Sample upload: `curl -F file=@demo/logs/sample-auth.log http://127.0.0.1:3000/api/logs/upload`.
+The gateway's `/internal/block` receives a fixed `attacker-lab` source, incident ID, reason and duration. It maintains a persisted denylist; the API stores a separate audit record.
 
-## Tests and checks
+## Quality gates
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test
-cargo build
+cargo test --workspace
+cargo build --workspace
 cd frontend && npm run build
 ```
 
-Native Rust tests cover parsing, time decay, cross-host detection, multi-stage reconstruction, normal false-positive protection, brute-force detection, scoring boundaries and response success/failure.
+The Docker integration test boots the prebuilt lab and proves normal behavior, distributed correlation, each per-host count below five, the gateway block, a real HTTP 403, SQLite persistence, and the forced-failure HTTP 401 path:
+
+```bash
+cd /home/neonjava/logshield
+cargo test -p logshield-api --test lab_e2e -- --ignored
+```
+
+Build the release binaries and Compose image before this explicit integration test. It clears **only LogShield lab data**. Run it when no other process owns localhost port 3000.
 
 ## Security and limitations
 
-The API binds to localhost, uploads are size and extension limited, lines are never executed, SQL uses bound parameters and React escapes text. The local API has no authentication because it is a demo; do not expose it to a network. Parser support is intentionally narrow. Baselines are lightweight and derived from available benign events rather than trained over long histories. Correlation currently groups by source IP in a 10-minute window and stores up to 2,000 recent events for analysis. A production version would need authenticated ingestion, robust parser plugins, durable baseline snapshots, stronger identity resolution, rate limits, analyst feedback and real response integrations with explicit authorization.
+The lab endpoints and gateway accept only fixed app names and paths. Logs are never executed; SQL uses bound parameters; upload size is capped; React escapes text. The API and internal gateway endpoints have no production authentication because this is an isolated local lab. Do not publish the gateway or API beyond localhost or reuse this setup on untrusted networks. The gateway trusts the controlled client's `x-lab-source` label; a production gateway must derive identity from authenticated network or mTLS context. TACG currently groups primarily by source and uses a simple baseline and bounded recent-event window. The file sensor polls rather than using kernel notifications and does not yet persist offsets across restarts; duplicate event IDs are ignored by SQLite. Docker packaging is Fedora 44 x86-64 specific. Production work includes authenticated ingestion, robust log formats, rotation-aware offsets, calibrated scores, durable agents, multi-tenant identity resolution and human-reviewed response policy.

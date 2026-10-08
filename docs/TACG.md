@@ -1,30 +1,32 @@
 # Temporal Attack Correlation Graph
 
-## Problem
+## Problem and contribution
 
-Single-event thresholds miss activity spread across hosts or stages. TACG asks whether weak events form a coherent attack story.
+A five-failure attack can be spread over three hosts as 2/2/1. A per-host threshold of five misses it. TACG correlates source identity, account, host and time to reconstruct a cross-host story. Event correlation exists elsewhere; this project's contribution is its transparent graph, cross-host threshold proof, attack-chain scoring, automated gateway action and observed verification.
 
 ## Nodes and edges
 
-Each normalized `SecurityEvent` is a node. Events from one source IP within 10 minutes are sorted by timestamp. Consecutive nodes receive an edge if they share an entity and have meaningful temporal proximity. Edge metadata records same source, destination, user, host or service plus risky transitions. Temporal strength is `exp(-Δt / 90 seconds)`. A six-second gap contributes about 0.94; a 90-second gap about 0.37.
+Each normalized log record is a node. Events from the same source inside a 10-minute window are sorted by time. Adjacent nodes receive an edge when they share an entity and have temporal proximity. Edge reasons list shared source, destination, username, host, service or request ID, plus a risky transition. Temporal weight is `exp(-Δt / 90 seconds)`; close events have stronger links.
 
-## Correlation features
+Gateway deny logs remain available as response evidence but do not count as app attack nodes. The graph is an in-memory Rust structure; SQL stores its edge evidence.
 
-- **Rarity:** rarity of suspicious event patterns, with full-stage chains rarer than repeated failures.
-- **Temporal:** mean time-decay strength between adjacent events.
-- **Entity:** shared source, destination, username, host or service with explicit weights.
-- **Transition:** risky ordered pairs such as failure → success, success → privilege and privilege → outbound activity.
-- **Cross-host:** same source failing against at least two hosts, with strongest score at three hosts and five failures.
-- **Behavior:** simple normal profile learns user hours, hosts, source IPs and common services from benign events; a burst score supplements novelty.
+## Candidate patterns
 
-A candidate incident requires a meaningful pattern: at least six failures, the five-failure three-host pattern, a full multi-stage chain, or unauthorized access. Thus normal logins do not become incidents solely due to time proximity.
+- **Distributed authentication:** at least five failures from one source across three hosts. Each host can remain below five.
+- **Brute force:** at least six failures in the window.
+- **Multi-stage:** at least two failures followed by a successful login, a lab privilege action and an outbound-style action. The current prototype recognizes presence and pairwise transitions; stricter full ordering is future work.
+- **Unauthorized access:** an app unauthorized-access event.
 
-## Score
+Normal successful logins alone are not candidates.
+
+## Explainable risk
 
 `risk = min(100, 20R + 20T + 15E + 20X + 10C + 15B + chain_bonus)`
 
-All six features are in `[0,1]`. The bonus is 32 for the full multi-stage chain, 18 for the distributed pattern and 12 for brute force. Every term is returned to the UI. For example, `R=.9, T=.9, E=.8, X=.75, C=1, B=.65` gives `18 + 18 + 12 + 15 + 10 + 9.75 + 18 = 100.75`, capped at 100. The bonus intentionally makes a coherent attack sequence outrank isolated anomalies.
+`R` is event rarity, `T` mean temporal strength, `E` mean shared-entity strength, `X` transition risk, `C` cross-host score and `B` behavioral deviation. The baseline learns usual user hours, hosts, source relationships and normal event volume from benign records. The explicit bonus is 8 for distributed auth, 12 for brute force and 25 for a multi-stage chain. Each weighted contribution and the bonus are stored in the incident JSON and shown in the UI.
 
-## Limitations
+For a distributed pattern with `R=.8, T=.98, E=.95, X=.75, C=1, B=.65`, the score is `16 + 19.6 + 14.25 + 15 + 10 + 9.75 + 8 = 92.6`, rounded to 93. Real timings and entity links make the precise score vary. A response requires both risk >=85 and detection confidence >=85.
 
-Source IP is the primary grouping key, so NAT or rotating IPs can distort chains. The prototype links consecutive events and does not perform full path search or identity resolution. The baseline is small and demo-oriented. Thresholds are deterministic and explainable, but require calibration against real labeled enterprise data before operational use.
+## Limits
+
+Source-IP grouping can be fooled by NAT or rotating source identities. The current graph uses adjacent event links rather than exhaustive path search. The small baseline and hand-tuned thresholds need calibration on representative labeled data before operational deployment. Graph explanations are evidence, not a probabilistic guarantee of malicious intent.

@@ -1,19 +1,21 @@
-# Pitch and judge preparation
+# Pitch
 
-## 20-second pitch
+“Traditional per-host threshold detection may miss weak malicious activity distributed across several systems. LogShield TACG correlates those events across identities, hosts and time, reconstructs the attack chain, performs an automated defensive action, and verifies that the response actually succeeded. Its security engine is implemented natively in Rust for memory safety, predictable performance and concurrent log processing.”
 
-“Traditional monitoring often evaluates security events independently. LogShield TACG correlates events across time, hosts, users and network identities to reconstruct the complete attack chain. It calculates an explainable risk score, performs confidence-controlled automated containment in an authorized environment, and verifies whether the response succeeded. LogShield TACG's security engine is implemented natively in Rust, allowing the correlation pipeline to process security events concurrently while maintaining memory safety and predictable performance.”
+## Likely judge questions
 
-## Likely questions
+**Are the events real?** Yes. The controlled client sends HTTP requests through the gateway; each app writes a JSON line; the read-only Rust sensor parses it. The generator never inserts attack events into TACG.
 
-**What is the innovation?** A transparent temporal graph joins weak evidence into a sequence and scores the chain, including activity spread across hosts.
+**What is novel?** We do not claim to invent event correlation. Our contribution is an explainable temporal graph with cross-host attack reconstruction, score decomposition, gateway containment and HTTP verification.
 
-**Why not an ML black box?** The hackathon goal needs defensible explanations. A statistical baseline supplements explicit correlation rules and every score component is visible.
+**Why is 2/2/1 suspicious?** Five failures from one source and account span three hosts inside a short window, even though no host reaches the threshold of five.
 
-**How does low and slow work?** Five failures from one source across three hosts share a temporal window and source identity; no host needs to cross a local threshold.
+**How is containment verified?** The Rust client retries through the gateway. The engine requires an applied block, HTTP 403 and a matching incident ID before setting `CONTAINED`.
 
-**Does it block an attacker?** No. Responses are local records and verification observes only submitted test events. Production integrations would require separate authorization.
+**What happens if blocking fails?** Lab mode forces gateway HTTP 503; the retry reaches the app and gets HTTP 401. The incident stays `RESPONSE_FAILED` and requires human intervention.
 
-**Why Rust?** Type and memory safety, low overhead and Tokio concurrency make it suitable for a long-running security agent.
+**Can it target the university network?** No. The lab client accepts only three named apps; Docker networks are internal; no external attack target parameter exists.
 
-**What are the main limitations?** Source-IP grouping, simple parser coverage, short baseline history and a demo-sized observation window. These are explicit future work, not hidden claims.
+**Why Rust?** Strong types, memory safety, Tokio concurrency and low overhead suit a future long-running sensor or gateway.
+
+**Production gaps?** Authentication and mTLS, source identity derived from the network, robust parser coverage, baseline calibration, durable sensor offsets, rule tuning and analyst feedback.
