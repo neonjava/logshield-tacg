@@ -32,6 +32,8 @@ pub struct Incident {
     pub created_at: DateTime<Utc>,
     pub source_ip: Option<String>,
     pub target: String,
+    #[serde(default)]
+    pub kind: String,
     pub risk: u8,
     pub severity: RiskLevel,
     pub status: IncidentStatus,
@@ -51,6 +53,15 @@ pub struct ResponseRecord {
     pub result: String,
     pub response_confidence: u8,
     pub evidence: Vec<Uuid>,
+    #[serde(default)]
+    pub proof: Vec<ResponseStep>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseStep {
+    pub timestamp: DateTime<Utc>,
+    pub stage: String,
+    pub detail: String,
+    pub http_status: Option<u16>,
 }
 impl RiskLevel {
     pub fn from_score(n: u8) -> Self {

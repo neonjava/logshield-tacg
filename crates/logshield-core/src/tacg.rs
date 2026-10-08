@@ -18,9 +18,9 @@ pub fn entity_strength(a: &SecurityEvent, b: &SecurityEvent) -> (f64, Vec<String
     let mut n: f64 = 0.0;
     let mut reasons = Vec::new();
     for (label, x, y, weight) in [
-        ("same source IP", &a.source_ip, &b.source_ip, 0.55),
+        ("same source", &a.source_ip, &b.source_ip, 0.55),
         (
-            "same destination IP",
+            "same destination",
             &a.destination_ip,
             &b.destination_ip,
             0.15,
@@ -28,6 +28,7 @@ pub fn entity_strength(a: &SecurityEvent, b: &SecurityEvent) -> (f64, Vec<String
         ("same username", &a.username, &b.username, 0.25),
         ("same host", &a.hostname, &b.hostname, 0.25),
         ("same service", &a.service, &b.service, 0.10),
+        ("same request", &a.request_id, &b.request_id, 0.10),
     ] {
         if x.is_some() && x == y {
             n += weight;
@@ -60,7 +61,11 @@ fn suspicious(t: EventType) -> bool {
     )
 }
 pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident> {
-    let mut sorted = events.to_vec();
+    let mut sorted: Vec<_> = events
+        .iter()
+        .filter(|e| e.hostname.as_deref() != Some("gateway"))
+        .cloned()
+        .collect();
     sorted.sort_by_key(|e| e.timestamp);
     let mut groups: HashMap<String, Vec<SecurityEvent>> = HashMap::new();
     for e in sorted {
@@ -134,8 +139,7 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 .map(|e| std::mem::discriminant(&e.event_type))
                 .collect();
             let has = |t: EventType| group.iter().any(|e| e.event_type == t);
-            let full_chain = has(EventType::MultiPortActivity)
-                && has(EventType::FailedLogin)
+            let full_chain = failures >= 2
                 && has(EventType::SuccessfulLogin)
                 && has(EventType::PrivilegeAction)
                 && has(EventType::UnusualNetworkActivity);
@@ -147,7 +151,7 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             let rarity = if full_chain {
                 1.0
             } else if distributed {
-                0.9
+                0.8
             } else if brute {
                 0.75
             } else {
@@ -182,9 +186,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 0.3
             });
             let bonus = if full_chain {
-                32.0
+                25.0
             } else if distributed {
-                18.0
+                8.0
             } else if brute {
                 12.0
             } else {
@@ -207,9 +211,7 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 reasons.push(format!("same source across {} hosts", hosts.len()));
             }
             if full_chain {
-                reasons.push(
-                    "ordered port → authentication → privilege → outbound attack chain".into(),
-                );
+                reasons.push("ordered authentication → privilege → outbound attack chain".into());
             }
             if brute {
                 reasons.push("repeated authentication failures in a 10-minute window".into());
@@ -237,8 +239,8 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             .min(99);
             let recommended_actions = match severity {
                 RiskLevel::Critical => vec![
-                    "Simulate temporary source isolation".into(),
-                    "Simulate session quarantine".into(),
+                    "Block source at the lab gateway for 60 seconds".into(),
+                    "Verify the block with a real lab request".into(),
                     "Preserve event evidence".into(),
                 ],
                 RiskLevel::High => vec!["Recommend containment".into(), "Preserve evidence".into()],
@@ -255,6 +257,15 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 created_at: Utc::now(),
                 source_ip: Some(source.clone()),
                 target,
+                kind: if distributed {
+                    "DISTRIBUTED AUTHENTICATION ATTACK".into()
+                } else if full_chain {
+                    "MULTI-STAGE INTRUSION".into()
+                } else if brute {
+                    "BRUTE FORCE AUTHENTICATION".into()
+                } else {
+                    "UNAUTHORIZED ACCESS".into()
+                },
                 risk: score.final_risk,
                 severity,
                 status: IncidentStatus::Active,
@@ -301,6 +312,15 @@ mod tests {
         assert_eq!(i[0].severity, RiskLevel::Critical);
         assert_eq!(i[0].events.len(), 7);
         assert!(i[0].edges.len() >= 6);
+    }
+    #[test]
+    fn five_event_lab_chain_is_critical() {
+        let all = scenario("multistage");
+        let events = all.into_iter().skip(2).collect::<Vec<_>>();
+        let incident = correlate(&events, &Baseline::default()).remove(0);
+        assert_eq!(incident.kind, "MULTI-STAGE INTRUSION");
+        assert!(incident.risk >= 85);
+        assert_eq!(incident.events.len(), 5);
     }
     #[test]
     fn brute_force_detected() {

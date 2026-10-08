@@ -1,3 +1,5 @@
+mod database;
+mod sensor;
 use axum::{
     Json, Router,
     extract::{
@@ -7,18 +9,27 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use chrono::Utc;
+use database as db;
 use logshield_core::{
     baseline::Baseline,
-    demo::scenario,
     event::SecurityEvent,
-    incident::{Incident, IncidentStatus, RiskLevel},
+    incident::{Incident, IncidentStatus},
     normalizer::parse_line,
-    response::{respond, verify},
+    response,
     tacg::correlate,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Row, SqlitePool};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -32,37 +43,63 @@ struct AppState {
     tx: mpsc::Sender<Vec<SecurityEvent>>,
     broadcast: broadcast::Sender<String>,
     processing: Arc<Mutex<()>>,
+    client: reqwest::Client,
+    gateway: String,
+    attacker: String,
+    lab_mode: bool,
+    log_dir: PathBuf,
+    sensor_online: Arc<AtomicBool>,
+    offsets: sensor::Offsets,
 }
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let db = SqlitePool::connect("sqlite://logshield.db?mode=rwc")
-        .await
-        .expect("database");
-    sqlx::query("CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, source_ip TEXT, payload TEXT NOT NULL)").execute(&db).await.unwrap();
-    sqlx::query("CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY, source_ip TEXT, risk INTEGER NOT NULL, payload TEXT NOT NULL)").execute(&db).await.unwrap();
-    let (tx, rx) = mpsc::channel(64);
-    let (broadcast, _) = broadcast::channel(256);
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://logshield.db?mode=rwc".into());
+    let pool = SqlitePool::connect(&database_url).await.expect("database");
+    db::init(&pool).await.expect("database schema");
+    let (tx, rx) = mpsc::channel(256);
+    let (broadcast, _) = broadcast::channel(512);
+    let log_dir = PathBuf::from(std::env::var("LOG_DIR").unwrap_or_else(|_| "./lab-logs".into()));
     let state = AppState {
-        db,
+        db: pool,
         tx,
         broadcast,
         processing: Arc::new(Mutex::new(())),
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap(),
+        gateway: std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()),
+        attacker: std::env::var("ATTACKER_URL").unwrap_or_else(|_| "http://127.0.0.1:8082".into()),
+        lab_mode: std::env::var("LAB_MODE").unwrap_or_else(|_| "true".into()) == "true",
+        log_dir: log_dir.clone(),
+        sensor_online: Arc::new(AtomicBool::new(false)),
+        offsets: Arc::new(Mutex::new(HashMap::new())),
     };
     tokio::spawn(worker(state.clone(), rx));
+    tokio::spawn(sensor::start(
+        log_dir,
+        state.tx.clone(),
+        state.sensor_online.clone(),
+        state.offsets.clone(),
+    ));
     let app = Router::new()
-        .route(
-            "/api/health",
-            get(|| async { Json(serde_json::json!({"status":"ok","engine":"Rust TACG"})) }),
-        )
+        .route("/api/health", get(health))
+        .route("/api/status", get(status))
         .route("/api/events", get(events).post(add_event))
         .route("/api/logs/upload", post(upload))
+        .route("/api/entities", get(entities))
         .route("/api/incidents", get(incidents))
         .route("/api/incidents/{id}", get(incident))
         .route("/api/incidents/{id}/respond", post(manual_response))
-        .route("/api/incidents/{id}/response", get(response))
+        .route("/api/incidents/{id}/response", get(response_status))
+        .route("/api/responses", get(responses))
         .route("/api/stats", get(stats))
-        .route("/api/demo/{name}", post(demo))
+        .route("/api/lab/run/{name}", post(run_lab))
+        .route("/api/lab/force-failure", post(force_failure))
+        .route("/api/lab/clear", post(clear_lab))
         .route("/ws/events", get(ws))
         .layer(DefaultBodyLimit::max(1_048_576))
         .layer(
@@ -73,70 +110,53 @@ async fn main() {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let bind = std::env::var("API_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .unwrap();
-    tracing::info!("listening on http://127.0.0.1:3000");
+        .expect("API_BIND");
+    tracing::info!(%bind,"LogShield API ready");
     axum::serve(listener, app).await.unwrap();
 }
 async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
     while let Some(batch) = rx.recv().await {
         let _guard = state.processing.lock().await;
+        let mut inserted = false;
         for e in &batch {
-            let payload = serde_json::to_string(e).unwrap();
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO events(id,timestamp,source_ip,payload) VALUES(?,?,?,?)",
-            )
-            .bind(e.id.to_string())
-            .bind(e.timestamp.to_rfc3339())
-            .bind(&e.source_ip)
-            .bind(payload)
-            .execute(&state.db)
-            .await;
-            let _ = state
-                .broadcast
-                .send(serde_json::json!({"type":"event","event":e}).to_string());
+            match db::insert_event(&state.db, e).await {
+                Ok(true) => {
+                    inserted = true;
+                    let _ = state
+                        .broadcast
+                        .send(serde_json::json!({"type":"event","event":e}).to_string());
+                }
+                Ok(false) => {}
+                Err(err) => tracing::error!(%err,"event insert failed"),
+            }
         }
-        let all = load_events(&state.db).await.unwrap_or_default();
+        if !inserted {
+            continue;
+        }
+        let all = db::events(&state.db).await.unwrap_or_default();
         let baseline = Baseline::learn(&all);
+        let existing = db::incidents(&state.db).await.unwrap_or_default();
         for mut new in correlate(&all, &baseline) {
-            let existing = sqlx::query(
-                "SELECT id,payload FROM incidents WHERE source_ip=? ORDER BY risk DESC",
-            )
-            .bind(&new.source_ip)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
             let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
-            let old = existing
+            if let Some(old) = existing
                 .iter()
-                .filter_map(|row| {
-                    serde_json::from_str::<Incident>(&row.get::<String, _>("payload")).ok()
-                })
-                .find(|i| i.events.iter().any(|e| ids.contains(&e.id)));
-            if let Some(mut old) = old {
+                .find(|i| i.events.iter().any(|e| ids.contains(&e.id)))
+            {
                 if old.response.is_some() {
-                    let new_events: Vec<_> = new
-                        .events
-                        .iter()
-                        .filter(|e| !old.events.iter().any(|p| p.id == e.id))
-                        .cloned()
-                        .collect();
-                    if !new_events.is_empty() {
-                        verify(&mut old, &new_events);
-                        save_incident(&state.db, &old).await;
-                        let _ = state.broadcast.send(
-                            serde_json::json!({"type":"incident","incident":old}).to_string(),
-                        );
-                    }
                     continue;
                 }
                 new.id = old.id;
             }
-            if new.severity == RiskLevel::Critical {
-                respond(&mut new);
+            if response::eligible(&new) && state.lab_mode {
+                response::begin(&mut new);
             }
-            save_incident(&state.db, &new).await;
+            if let Err(err) = db::save_incident(&state.db, &new).await {
+                tracing::error!(%err,"incident save failed");
+                continue;
+            }
             let _ = state
                 .broadcast
                 .send(serde_json::json!({"type":"incident","incident":new}).to_string());
@@ -144,61 +164,147 @@ async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
                 let state = state.clone();
                 let id = new.id.to_string();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _guard = state.processing.lock().await;
-                    let Ok(Json(mut current)) = incident(State(state.clone()), Path(id)).await
-                    else {
-                        return;
-                    };
-                    if current.status != IncidentStatus::PendingVerification {
-                        return;
-                    }
-                    let events = load_events(&state.db).await.unwrap_or_default();
-                    verify(&mut current, &events);
-                    save_incident(&state.db, &current).await;
-                    let _ = state.broadcast.send(
-                        serde_json::json!({"type":"incident","incident":current}).to_string(),
-                    );
+                    execute_response(state, id).await;
                 });
             }
         }
     }
 }
-async fn save_incident(db: &SqlitePool, i: &Incident) {
-    let _=sqlx::query("INSERT INTO incidents(id,source_ip,risk,payload) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET risk=excluded.risk,payload=excluded.payload").bind(i.id.to_string()).bind(&i.source_ip).bind(i.risk as i64).bind(serde_json::to_string(i).unwrap()).execute(db).await;
+async fn execute_response(state: AppState, id: String) {
+    let Some(mut incident) = db::incident(&state.db, &id).await.ok().flatten() else {
+        return;
+    };
+    let source = incident.source_ip.clone().unwrap_or_default();
+    let payload = serde_json::json!({"source":source,"incident_id":id,"reason":"high confidence correlated intrusion","duration_seconds":60});
+    let block_result = state
+        .client
+        .post(format!("{}/internal/block", state.gateway))
+        .json(&payload)
+        .send()
+        .await;
+    let (applied, block_status, block_body) = match block_result {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.json::<Value>().await.unwrap_or_default();
+            (
+                status == 200 && body.get("applied") == Some(&Value::Bool(true)),
+                status,
+                body,
+            )
+        }
+        Err(e) => (false, 0, serde_json::json!({"error":e.to_string()})),
+    };
+    response::record(
+        &mut incident,
+        if applied {
+            "GATEWAY_BLOCK_APPLIED"
+        } else {
+            "GATEWAY_BLOCK_FAILED"
+        },
+        block_body.to_string(),
+        Some(block_status),
+    );
+    if applied {
+        let _=sqlx::query("INSERT OR REPLACE INTO gateway_blocks(incident_id,source,expires_at,payload) VALUES(?,?,?,?)").bind(&id).bind(&source).bind(block_body.pointer("/block/expires_at").and_then(Value::as_str).unwrap_or("")).bind(block_body.to_string()).execute(&state.db).await;
+    }
+    response::record(
+        &mut incident,
+        "VERIFICATION_REQUEST_SENT",
+        "attacker-lab retries a fixed login through the gateway".into(),
+        None,
+    );
+    let verify_result = state
+        .client
+        .post(format!("{}/verify", state.attacker))
+        .send()
+        .await;
+    let observation = match verify_result {
+        Ok(r) => r
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"status":0})),
+        Err(e) => serde_json::json!({"error":e.to_string(),"status":0}),
+    };
+    let http_status = observation
+        .get("status")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u16;
+    let blocked = observation.pointer("/body/blocked") == Some(&Value::Bool(true));
+    let matched = observation
+        .pointer("/body/incident_id")
+        .and_then(Value::as_str)
+        == Some(id.as_str());
+    response::record(
+        &mut incident,
+        if http_status == 403 {
+            "HTTP_403_RECEIVED"
+        } else {
+            "VERIFICATION_HTTP_RESULT"
+        },
+        observation.to_string(),
+        Some(http_status),
+    );
+    response::finish(&mut incident, blocked && applied, http_status, matched);
+    let _=sqlx::query("INSERT INTO verification_attempts(id,incident_id,timestamp,http_status,blocked,matched,payload) VALUES(?,?,?,?,?,?,?)").bind(uuid::Uuid::new_v4().to_string()).bind(&id).bind(Utc::now().to_rfc3339()).bind(http_status as i64).bind(blocked).bind(matched).bind(observation.to_string()).execute(&state.db).await;
+    if let Err(e) = db::save_incident(&state.db, &incident).await {
+        tracing::error!(%e,"response save failed");
+    }
+    let _ = state
+        .broadcast
+        .send(serde_json::json!({"type":"incident","incident":incident}).to_string());
 }
-async fn load_events(db: &SqlitePool) -> Result<Vec<SecurityEvent>, sqlx::Error> {
-    let rows = sqlx::query("SELECT payload FROM events ORDER BY timestamp DESC LIMIT 2000")
-        .fetch_all(db)
-        .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| serde_json::from_str(&r.get::<String, _>("payload")).ok())
-        .collect())
+async fn health() -> Json<Value> {
+    Json(serde_json::json!({"status":"ok","engine":"Rust TACG"}))
 }
-async fn load_incidents(db: &SqlitePool) -> Result<Vec<Incident>, sqlx::Error> {
-    let rows = sqlx::query("SELECT payload FROM incidents ORDER BY risk DESC")
-        .fetch_all(db)
-        .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| serde_json::from_str(&r.get::<String, _>("payload")).ok())
-        .collect())
+async fn status(State(s): State<AppState>) -> ApiResult<Value> {
+    let gateway = s
+        .client
+        .get(format!("{}/health", s.gateway))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+    let attacker = s
+        .client
+        .get(format!("{}/health", s.attacker))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+    let services = s
+        .client
+        .get(format!("{}/internal/services", s.gateway))
+        .send()
+        .await
+        .ok();
+    let service_body = if let Some(r) = services {
+        r.json::<Value>().await.unwrap_or_default()
+    } else {
+        Value::Null
+    };
+    let database = sqlx::query("SELECT 1").fetch_one(&s.db).await.is_ok();
+    let recent = sqlx::query("SELECT COUNT(*) AS n FROM events WHERE timestamp>=?")
+        .bind((Utc::now() - chrono::Duration::seconds(60)).to_rfc3339())
+        .fetch_one(&s.db)
+        .await
+        .map(|r| r.get::<i64, _>("n"))
+        .unwrap_or(0);
+    let last = sqlx::query("SELECT timestamp FROM events ORDER BY timestamp DESC LIMIT 1")
+        .fetch_optional(&s.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.get::<String, _>("timestamp"));
+    Ok(Json(
+        serde_json::json!({"gateway":gateway,"attacker":attacker,"sensor":s.sensor_online.load(Ordering::Relaxed),"tacg":true,"database":database,"services_online":service_body.get("online").and_then(Value::as_u64).unwrap_or(0),"services_total":3,"force_response_failure":service_body.get("force_response_failure").and_then(Value::as_bool).unwrap_or(false),"events_per_second":recent as f64/60.0,"last_event":last}),
+    ))
 }
 async fn events(State(s): State<AppState>) -> ApiResult<Vec<SecurityEvent>> {
-    Ok(Json(load_events(&s.db).await.map_err(internal)?))
+    Ok(Json(db::events(&s.db).await.map_err(internal)?))
 }
-async fn add_event(
-    State(s): State<AppState>,
-    Json(e): Json<SecurityEvent>,
-) -> ApiResult<serde_json::Value> {
+async fn add_event(State(s): State<AppState>, Json(e): Json<SecurityEvent>) -> ApiResult<Value> {
     s.tx.send(vec![e]).await.map_err(internal)?;
     Ok(Json(serde_json::json!({"queued":1})))
 }
-async fn upload(
-    State(s): State<AppState>,
-    mut multipart: Multipart,
-) -> ApiResult<serde_json::Value> {
+async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> ApiResult<Value> {
     let mut batch = Vec::new();
     let mut rejected = 0;
     while let Some(field) = multipart.next_field().await.map_err(bad)? {
@@ -239,39 +345,68 @@ async fn upload(
         serde_json::json!({"queued":count,"rejected":rejected}),
     ))
 }
+async fn entities(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
+    let rows=sqlx::query("SELECT kind,value,first_seen,last_seen,event_count FROM entities ORDER BY event_count DESC LIMIT 100").fetch_all(&s.db).await.map_err(internal)?;
+    Ok(Json(rows.iter().map(|r|serde_json::json!({"kind":r.get::<String,_>("kind"),"value":r.get::<String,_>("value"),"first_seen":r.get::<String,_>("first_seen"),"last_seen":r.get::<String,_>("last_seen"),"event_count":r.get::<i64,_>("event_count")})).collect()))
+}
 async fn incidents(State(s): State<AppState>) -> ApiResult<Vec<Incident>> {
-    Ok(Json(load_incidents(&s.db).await.map_err(internal)?))
+    Ok(Json(db::incidents(&s.db).await.map_err(internal)?))
 }
 async fn incident(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Incident> {
-    let row = sqlx::query("SELECT payload FROM incidents WHERE id=?")
-        .bind(id)
-        .fetch_optional(&s.db)
+    db::incident(&s.db, &id)
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "incident not found".into()))
+}
+async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Incident> {
+    let mut i = db::incident(&s.db, &id)
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "incident not found".into()))?;
-    Ok(Json(
-        serde_json::from_str(&row.get::<String, _>("payload")).map_err(internal)?,
-    ))
-}
-async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Incident> {
-    let Json(mut i) = incident(State(s.clone()), Path(id)).await?;
-    respond(&mut i);
-    let all = load_events(&s.db).await.map_err(internal)?;
-    verify(&mut i, &all);
-    save_incident(&s.db, &i).await;
-    let _ = s
-        .broadcast
-        .send(serde_json::json!({"type":"incident","incident":i}).to_string());
+    if !s.lab_mode {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lab gateway not configured".into(),
+        ));
+    }
+    if i.response.is_some() {
+        return Err((StatusCode::CONFLICT, "response already attempted".into()));
+    }
+    response::begin(&mut i);
+    db::save_incident(&s.db, &i).await.map_err(internal)?;
+    let state = s.clone();
+    tokio::spawn(async move {
+        execute_response(state, id).await;
+    });
     Ok(Json(i))
 }
-async fn response(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<serde_json::Value> {
-    let Json(i) = incident(State(s), Path(id)).await?;
+async fn response_status(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Value> {
+    let i = db::incident(&s.db, &id)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "incident not found".into()))?;
+    let rows = sqlx::query(
+        "SELECT payload FROM verification_attempts WHERE incident_id=? ORDER BY timestamp",
+    )
+    .bind(&id)
+    .fetch_all(&s.db)
+    .await
+    .map_err(internal)?;
+    let attempts: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| serde_json::from_str(&r.get::<String, _>("payload")).ok())
+        .collect();
     Ok(Json(
-        serde_json::json!({"status":i.status,"response":i.response}),
+        serde_json::json!({"status":i.status,"response":i.response,"verification_attempts":attempts}),
     ))
+}
+async fn responses(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
+    let rows = sqlx::query("SELECT incident_id,status,payload FROM responses ORDER BY rowid DESC")
+        .fetch_all(&s.db)
+        .await
+        .map_err(internal)?;
+    Ok(Json(rows.iter().map(|r|serde_json::json!({"incident_id":r.get::<String,_>("incident_id"),"status":r.get::<String,_>("status"),"response":serde_json::from_str::<Value>(&r.get::<String,_>("payload")).unwrap_or_default()})).collect()))
 }
 #[derive(Serialize)]
 struct Stats {
@@ -279,13 +414,13 @@ struct Stats {
     active_incidents: usize,
     critical_incidents: usize,
     contained_incidents: usize,
-    average_risk: f64,
+    response_failures: usize,
     risk_distribution: HashMap<String, usize>,
     host_activity: HashMap<String, usize>,
 }
 async fn stats(State(s): State<AppState>) -> ApiResult<Stats> {
-    let events = load_events(&s.db).await.map_err(internal)?;
-    let incidents = load_incidents(&s.db).await.map_err(internal)?;
+    let events = db::events(&s.db).await.map_err(internal)?;
+    let incidents = db::incidents(&s.db).await.map_err(internal)?;
     let mut risk_distribution = HashMap::new();
     let mut host_activity = HashMap::new();
     for i in &incidents {
@@ -298,11 +433,6 @@ async fn stats(State(s): State<AppState>) -> ApiResult<Stats> {
             *host_activity.entry(h.clone()).or_insert(0) += 1;
         }
     }
-    let average_risk = if incidents.is_empty() {
-        0.0
-    } else {
-        incidents.iter().map(|i| i.risk as f64).sum::<f64>() / incidents.len() as f64
-    };
     Ok(Json(Stats {
         events_processed: events.len(),
         active_incidents: incidents
@@ -312,31 +442,83 @@ async fn stats(State(s): State<AppState>) -> ApiResult<Stats> {
                     i.status,
                     IncidentStatus::Active
                         | IncidentStatus::Monitoring
+                        | IncidentStatus::PendingVerification
                         | IncidentStatus::ResponseFailed
                 )
             })
             .count(),
-        critical_incidents: incidents
-            .iter()
-            .filter(|i| i.severity == RiskLevel::Critical)
-            .count(),
+        critical_incidents: incidents.iter().filter(|i| i.risk >= 85).count(),
         contained_incidents: incidents
             .iter()
             .filter(|i| i.status == IncidentStatus::Contained)
             .count(),
-        average_risk,
+        response_failures: incidents
+            .iter()
+            .filter(|i| i.status == IncidentStatus::ResponseFailed)
+            .count(),
         risk_distribution,
         host_activity,
     }))
 }
-async fn demo(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<serde_json::Value> {
-    if !["normal", "bruteforce", "distributed", "multistage"].contains(&name.as_str()) {
-        return Err((StatusCode::NOT_FOUND, "unknown scenario".into()));
+async fn run_lab(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    if !s.lab_mode {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
     }
-    let batch = scenario(&name);
-    let n = batch.len();
-    s.tx.send(batch).await.map_err(internal)?;
-    Ok(Json(serde_json::json!({"scenario":name,"queued":n})))
+    if !["normal", "distributed", "multistage"].contains(&name.as_str()) {
+        return Err((StatusCode::NOT_FOUND, "fixed scenarios only".into()));
+    }
+    let r = s
+        .client
+        .post(format!("{}/run/{name}", s.attacker))
+        .send()
+        .await
+        .map_err(internal)?;
+    let status = r.status();
+    let body = r.json::<Value>().await.map_err(internal)?;
+    if !status.is_success() {
+        return Err((StatusCode::BAD_GATEWAY, body.to_string()));
+    }
+    Ok(Json(body))
+}
+#[derive(Deserialize)]
+struct Toggle {
+    enabled: bool,
+}
+async fn force_failure(State(s): State<AppState>, Json(toggle): Json<Toggle>) -> ApiResult<Value> {
+    if !s.lab_mode {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
+    }
+    let r = s
+        .client
+        .post(format!("{}/internal/force-failure", s.gateway))
+        .json(&serde_json::json!({"enabled":toggle.enabled}))
+        .send()
+        .await
+        .map_err(internal)?;
+    Ok(Json(r.json::<Value>().await.map_err(internal)?))
+}
+async fn clear_lab(State(s): State<AppState>) -> ApiResult<Value> {
+    if !s.lab_mode {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
+    }
+    let _guard = s.processing.lock().await;
+    let r = s
+        .client
+        .post(format!("{}/internal/reset", s.gateway))
+        .send()
+        .await
+        .map_err(internal)?;
+    if !r.status().is_success() {
+        return Err((StatusCode::BAD_GATEWAY, "gateway reset failed".into()));
+    }
+    sensor::skip_existing(&s.log_dir, &s.offsets).await;
+    db::clear(&s.db).await.map_err(internal)?;
+    let _ = s
+        .broadcast
+        .send(serde_json::json!({"type":"reset"}).to_string());
+    Ok(Json(
+        serde_json::json!({"cleared":true,"note":"database and denylist cleared; raw lab logs retained"}),
+    ))
 }
 async fn ws(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl axum::response::IntoResponse {
     ws.on_upgrade(move |socket| socket_loop(socket, s.broadcast.subscribe()))
@@ -349,7 +531,7 @@ async fn socket_loop(mut socket: WebSocket, mut rx: broadcast::Receiver<String>)
     }
 }
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    tracing::error!("{e}");
+    tracing::error!(%e,"internal error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
 }
 fn bad<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
