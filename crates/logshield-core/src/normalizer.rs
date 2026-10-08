@@ -7,8 +7,10 @@ pub fn parse_line(line: &str) -> Result<SecurityEvent, String> {
         return Err("empty or oversized log line".into());
     }
     if line.starts_with('{') {
-        return serde_json::from_str::<SecurityEvent>(line)
-            .map_err(|e| format!("invalid JSON event: {e}"));
+        let mut event = serde_json::from_str::<SecurityEvent>(line)
+            .map_err(|e| format!("invalid JSON event: {e}"))?;
+        event.raw_message = line.to_owned();
+        return Ok(event);
     }
     let lower = line.to_ascii_lowercase();
     let event_type =
@@ -93,5 +95,13 @@ mod tests {
             parse_line("2026-10-08T10:04:01Z firewall SRC=10.0.0.50 DST=10.0.0.1 DPT=22 DENIED")
                 .unwrap();
         assert_eq!(b.port, Some(22));
+    }
+    #[test]
+    fn structured_log_keeps_raw_evidence_and_request_id() {
+        let line = r#"{"timestamp":"2026-10-08T10:04:12Z","event_type":"failed_login","source_ip":"attacker-lab","hostname":"app-a","username":"demo","request_id":"req-1"}"#;
+        let event = parse_line(line).unwrap();
+        assert_eq!(event.event_type, EventType::FailedLogin);
+        assert_eq!(event.request_id.as_deref(), Some("req-1"));
+        assert_eq!(event.raw_message, line);
     }
 }

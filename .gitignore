@@ -7,3 +7,5 @@
 .env
 
 /frontend/*.tsbuildinfo
+/lab-logs
+/lab-state

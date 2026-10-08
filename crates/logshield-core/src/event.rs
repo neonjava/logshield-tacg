@@ -33,6 +33,8 @@ pub struct SecurityEvent {
     pub result: Option<String>,
     pub severity_hint: Option<String>,
     #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
     pub raw_message: String,
 }
 impl SecurityEvent {
@@ -50,6 +52,7 @@ impl SecurityEvent {
             action: None,
             result: None,
             severity_hint: None,
+            request_id: None,
             raw_message: String::new(),
         }
     }

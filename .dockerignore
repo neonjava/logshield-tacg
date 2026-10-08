@@ -1,0 +1,8 @@
+.git
+frontend/node_modules
+frontend/dist
+*.db
+*.db-wal
+*.db-shm
+lab-logs
+lab-state

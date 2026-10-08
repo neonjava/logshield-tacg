@@ -1,0 +1,73 @@
+name: logshield
+x-lab-image: &lab-image
+  build: .
+  image: logshield-rust:local
+  restart: unless-stopped
+services:
+  logshield-api:
+    <<: *lab-image
+    command: ["logshield-api"]
+    environment:
+      API_BIND: 0.0.0.0:3000
+      DATABASE_URL: sqlite:///state/logshield.db?mode=rwc
+      LOG_DIR: /logs
+      GATEWAY_URL: http://logshield-gateway:8080
+      ATTACKER_URL: http://attacker-lab:8080
+      LAB_MODE: "true"
+    volumes:
+      - lab-logs:/logs:ro
+      - api-state:/state
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - logshield-gateway
+      - attacker-lab
+    networks: [control, ingress]
+  logshield-gateway:
+    <<: *lab-image
+    command: ["logshield-lab"]
+    environment:
+      LAB_ROLE: gateway
+      LOG_DIR: /logs
+      BLOCK_FILE: /state/blocks.json
+    volumes:
+      - lab-logs:/logs
+      - gateway-state:/state
+    depends_on: [app-a, app-b, app-c]
+    networks: [control, edge, backend]
+  app-a:
+    <<: *lab-image
+    command: ["logshield-lab"]
+    environment: {LAB_ROLE: app, APP_NAME: app-a, LOG_DIR: /logs}
+    volumes: ["lab-logs:/logs"]
+    networks: [backend]
+  app-b:
+    <<: *lab-image
+    command: ["logshield-lab"]
+    environment: {LAB_ROLE: app, APP_NAME: app-b, LOG_DIR: /logs}
+    volumes: ["lab-logs:/logs"]
+    networks: [backend]
+  app-c:
+    <<: *lab-image
+    command: ["logshield-lab"]
+    environment: {LAB_ROLE: app, APP_NAME: app-c, LOG_DIR: /logs}
+    volumes: ["lab-logs:/logs"]
+    networks: [backend]
+  attacker-lab:
+    <<: *lab-image
+    command: ["logshield-lab"]
+    environment: {LAB_ROLE: attacker, GATEWAY_URL: "http://logshield-gateway:8080"}
+    networks: [control, edge]
+networks:
+  ingress:
+    driver: bridge
+  control:
+    internal: true
+  edge:
+    internal: true
+  backend:
+    internal: true
+volumes:
+  lab-logs:
+  api-state:
+  gateway-state:
