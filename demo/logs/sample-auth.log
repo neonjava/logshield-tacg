@@ -1,0 +1,5 @@
+Oct  8 10:04:12 server-a sshd[123]: Failed password for admin from 10.0.0.50 port 51234 ssh2
+Oct  8 10:04:18 server-a sshd[123]: Failed password for admin from 10.0.0.50 port 51234 ssh2
+Oct  8 10:04:24 server-b sshd[123]: Failed password for admin from 10.0.0.50 port 51234 ssh2
+Oct  8 10:04:30 server-b sshd[123]: Failed password for admin from 10.0.0.50 port 51234 ssh2
+Oct  8 10:04:36 server-c sshd[123]: Failed password for admin from 10.0.0.50 port 51234 ssh2
