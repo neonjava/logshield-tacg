@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/logshield-core", "crates/logshield-api"]
+resolver = "2"
