@@ -129,20 +129,45 @@ function App() {
       setHealth(h);
       setForce(h.force_response_failure);
       setEntities(n);
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      // A backend restart is an expected transient state during a local demo.
+      setHealth(null);
     }
   };
   useEffect(() => {
     refresh();
     const timer = setInterval(refresh, 2500);
-    const ws = new WebSocket(`ws://${location.host}/ws/events`);
-    ws.onopen = () => setLive(true);
-    ws.onclose = () => setLive(false);
-    ws.onmessage = () => refresh();
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    let delay = 1000;
+    const connect = () => {
+      if (stopped) return;
+      const protocol = location.protocol === "https:" ? "wss" : "ws";
+      socket = new WebSocket(
+        `${protocol}://${location.hostname}:3000/ws/events`,
+      );
+      socket.onopen = () => {
+        setLive(true);
+        delay = 1000;
+        refresh();
+      };
+      socket.onmessage = () => refresh();
+      socket.onerror = () => socket?.close();
+      socket.onclose = () => {
+        setLive(false);
+        if (!stopped) {
+          reconnectTimer = setTimeout(connect, delay);
+          delay = Math.min(delay * 2, 10000);
+        }
+      };
+    };
+    connect();
     return () => {
+      stopped = true;
       clearInterval(timer);
-      ws.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket?.close();
     };
   }, []);
   const act = async (name: string, fn: () => Promise<any>) => {
@@ -270,7 +295,7 @@ function App() {
           </div>
           <span className={"live " + (live ? "" : "offline")}>
             <span className="green-dot" />
-            {live ? "LIVE STREAM" : "CONNECTING"}
+            {live ? "LIVE STREAM" : "RECONNECTING"}
           </span>
         </header>
         {error && (
@@ -489,7 +514,7 @@ function App() {
                 </div>
                 <div>
                   <span className={"status " + chosen.status.toLowerCase()}>
-                    {chosen.status}
+                    {title(chosen.status)}
                   </span>
                   <p>Confidence {chosen.confidence}%</p>
                 </div>
@@ -739,7 +764,7 @@ function App() {
                     <h2>Response and actual verification</h2>
                   </div>
                   <span className={"status " + chosen.status.toLowerCase()}>
-                    {chosen.status}
+                    {title(chosen.status)}
                   </span>
                 </div>
                 {chosen.response ? (
@@ -914,7 +939,7 @@ function App() {
                   }}
                 >
                   <span className={"status " + i.status.toLowerCase()}>
-                    {i.status}
+                    {title(i.status)}
                   </span>
                   <span>{short(i.id)}</span>
                   <strong>{i.source_ip}</strong>
@@ -938,10 +963,10 @@ function App() {
             <div className="lab-banner">
               <FlaskConical size={22} />
               <div>
-                <strong>ISOLATED LOCAL TEST ENVIRONMENT</strong>
+                <strong>ISOLATED LOCAL SECURITY LAB</strong>
                 <p>
-                  Fixed requests stay inside the Docker lab. No arbitrary
-                  targets or external systems.
+                  All traffic is restricted to controlled Docker services. No
+                  external systems are targeted.
                 </p>
               </div>
             </div>
@@ -1112,7 +1137,9 @@ function IncidentRow({ i, onClick }: { i: Incident; onClick: () => void }) {
           edges
         </small>
       </span>
-      <span className={"status " + i.status.toLowerCase()}>{i.status}</span>
+      <span className={"status " + i.status.toLowerCase()}>
+        {title(i.status)}
+      </span>
       <ArrowRight size={15} />
     </button>
   );
