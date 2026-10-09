@@ -25,6 +25,31 @@ read-only Rust sensor → normalizer → TACG → incident → SQLite
 
 All security processing, services, database access, API and WebSocket are Rust. React only presents evidence. Rust provides memory safety, strong types, predictable performance, Tokio concurrency and low runtime overhead for a future long-running agent. See [architecture](docs/ARCHITECTURE.md).
 
+### Timeline: current workflow
+
+| Step | What happens now |
+|---|---|
+| 1. Request | A Lab button, one of the three sample pages, or a fixed-target terminal command asks the Rust lab client to send a request. |
+| 2. Gateway | The Rust gateway checks its local denylist, then either forwards the request to app-a/b/c or returns HTTP 403. |
+| 3. Real log | The selected Rust app handles the request and appends a structured JSON record to its shared log file. |
+| 4. Detection | The read-only Rust sensor follows new log lines. Normalization creates typed events; TACG links them across source, user, host, time and event transitions. |
+| 5. Incident | The Rust risk engine creates an explainable incident and persists events, graph edges, scores and evidence in SQLite. REST and WebSocket update the React dashboard. |
+| 6. Response | For an eligible high-confidence incident, the response engine requests a 60-second block from the lab gateway. |
+| 7. Verification | The lab client retries. A matching HTTP 403 proves containment; if the request still reaches the app, the incident becomes `RESPONSE_FAILED`. |
+
+### Current infrastructure
+
+| Component | Runs as | Purpose |
+|---|---|---|
+| SOC dashboard and three sample pages | React/Vite on host `127.0.0.1:5173` | Operator view and controlled manual requests; no detection logic |
+| `logshield-api` | Rust Axum Docker service, exposed only at `127.0.0.1:3000` | REST, WebSocket, file sensor, TACG, incidents, response and SQLite |
+| `attacker-lab` | Rust Docker service | Sends only predefined requests to the gateway and performs verification retries |
+| `logshield-gateway` | Rust Docker service | Fixed app routing, local denylist and actual HTTP 403 enforcement |
+| `app-a`, `app-b`, `app-c` | Three Rust Docker services | Dummy login and safe lab operations; each writes its own JSON log |
+| Storage | Docker named volumes | Shared app logs, SQLite state and persisted gateway block records |
+
+The three app pages are browser **client views**, while the actual applications run as isolated Docker services. Only the dashboard and API have localhost host ports. Docker's internal networks carry lab traffic; this setup never modifies the host firewall or contacts arbitrary targets.
+
 ## Requirements and startup
 
 The supplied fast Docker image packages **host-built Fedora 44 x86-64 Rust binaries** into a Fedora 44 runtime. This matches the current local development machine. Install stable Rust, Docker with the Compose plugin, Node 22+ and npm. For another host OS, build inside a compatible Linux environment or adapt the Dockerfile.
