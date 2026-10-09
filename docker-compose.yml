@@ -14,6 +14,9 @@ services:
       GATEWAY_URL: http://logshield-gateway:8080
       ATTACKER_URL: http://attacker-lab:8080
       LAB_MODE: "true"
+      LOGSHIELD_INGEST_A: ${LOGSHIELD_INGEST_A:?run logshield-agent init-demo}
+      LOGSHIELD_INGEST_B: ${LOGSHIELD_INGEST_B:?run logshield-agent init-demo}
+      LOGSHIELD_INGEST_C: ${LOGSHIELD_INGEST_C:?run logshield-agent init-demo}
     volumes:
       - lab-logs:/logs:ro
       - api-state:/state
@@ -33,7 +36,7 @@ services:
     volumes:
       - lab-logs:/logs
       - gateway-state:/state
-    depends_on: [app-a, app-b, app-c]
+    depends_on: [app-a, app-b, app-c, infra-a, infra-b, infra-c]
     networks: [control, edge, backend]
   app-a:
     <<: *lab-image
@@ -58,6 +61,74 @@ services:
     command: ["logshield-lab"]
     environment: {LAB_ROLE: attacker, GATEWAY_URL: "http://logshield-gateway:8080"}
     networks: [control, edge]
+  session-store:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    networks: [backend]
+  app-database:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: logshield_demo
+      POSTGRES_PASSWORD: ${LOGSHIELD_PG_PASSWORD:?run logshield-agent init-demo}
+      POSTGRES_DB: shared_app
+    volumes: ["app-db:/var/lib/postgresql/data"]
+    networks: [backend]
+  infra-a:
+    <<: *lab-image
+    command: ["logshield-infra"]
+    environment: &infra-env
+      INFRA_NAME: infra-a
+      INFRA_ROLE: operations
+      LOG_DIR: /logs
+      APP_DATABASE_URL: postgres://logshield_demo:${LOGSHIELD_PG_PASSWORD}@app-database:5432/shared_app
+      REDIS_URL: redis://session-store:6379
+      LAB_DEMO_PASSWORD: hackathon123
+    volumes: ["infra-a-logs:/logs"]
+    depends_on: [app-database, session-store]
+    networks: [backend]
+  infra-b:
+    <<: *lab-image
+    command: ["logshield-infra"]
+    environment:
+      <<: *infra-env
+      INFRA_NAME: infra-b
+      INFRA_ROLE: reports
+    volumes: ["infra-b-logs:/logs"]
+    depends_on: [app-database, session-store]
+    networks: [backend]
+  infra-c:
+    <<: *lab-image
+    command: ["logshield-infra"]
+    environment:
+      <<: *infra-env
+      INFRA_NAME: infra-c
+      INFRA_ROLE: inventory
+    volumes: ["infra-c-logs:/logs"]
+    depends_on: [app-database, session-store]
+    networks: [backend]
+  infra-agent-a:
+    <<: *lab-image
+    command: ["logshield-agent"]
+    environment: {API_URL: "http://logshield-api:3000", SOURCE_ID: infra-a, INGEST_TOKEN: "${LOGSHIELD_INGEST_A}", LOG_FILE: /logs/infra-a.log, STATE_FILE: /state/offset}
+    volumes: ["infra-a-logs:/logs:ro", "infra-agent-a-state:/state"]
+    depends_on: [logshield-api, infra-a]
+    networks: [control]
+  infra-agent-b:
+    <<: *lab-image
+    command: ["logshield-agent"]
+    environment: {API_URL: "http://logshield-api:3000", SOURCE_ID: infra-b, INGEST_TOKEN: "${LOGSHIELD_INGEST_B}", LOG_FILE: /logs/infra-b.log, STATE_FILE: /state/offset}
+    volumes: ["infra-b-logs:/logs:ro", "infra-agent-b-state:/state"]
+    depends_on: [logshield-api, infra-b]
+    networks: [control]
+  infra-agent-c:
+    <<: *lab-image
+    command: ["logshield-agent"]
+    environment: {API_URL: "http://logshield-api:3000", SOURCE_ID: infra-c, INGEST_TOKEN: "${LOGSHIELD_INGEST_C}", LOG_FILE: /logs/infra-c.log, STATE_FILE: /state/offset}
+    volumes: ["infra-c-logs:/logs:ro", "infra-agent-c-state:/state"]
+    depends_on: [logshield-api, infra-c]
+    networks: [control]
 networks:
   ingress:
     driver: bridge
@@ -71,3 +142,10 @@ volumes:
   lab-logs:
   api-state:
   gateway-state:
+  app-db:
+  infra-a-logs:
+  infra-b-logs:
+  infra-c-logs:
+  infra-agent-a-state:
+  infra-agent-b-state:
+  infra-agent-c-state:

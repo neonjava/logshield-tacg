@@ -29,7 +29,8 @@ pub async fn start(
                     for line in lines {
                         if let Ok(text) = std::str::from_utf8(&line) {
                             match parse_line(text) {
-                                Ok(event) => {
+                                Ok(mut event) => {
+                                    event.origin = Some("lab_sensor".into());
                                     if tx.send(vec![event]).await.is_err() {
                                         return;
                                     }
