@@ -185,6 +185,392 @@ fn ordered_attack_chain(events: &[SecurityEvent]) -> bool {
                     })
         })
 }
+/// Returns true if all authentication events in the group belong to an established
+/// user profile where the source IP and targeted hosts are present in the historical baseline.
+fn is_familiar_auth(group: &[SecurityEvent], baseline: &Baseline) -> bool {
+    let auth_events: Vec<_> = group
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event_type,
+                EventType::FailedLogin
+                    | EventType::SuccessfulLogin
+                    | EventType::MfaFailure
+                    | EventType::PasswordAccepted
+            )
+        })
+        .collect();
+    if auth_events.is_empty() {
+        return false;
+    }
+    auth_events.iter().all(|e| {
+        e.username
+            .as_deref()
+            .and_then(|user| baseline.users.get(user))
+            .is_some_and(|profile| {
+                profile.successful_logins >= 3
+                    && e.source_ip
+                        .as_deref()
+                        .is_some_and(|ip| profile.source_ips.contains(ip))
+                    && e.hostname
+                        .as_deref()
+                        .is_some_and(|host| profile.hosts.contains(host))
+            })
+    })
+}
+
+fn evaluate_cluster(
+    group: &[SecurityEvent],
+    baseline: &Baseline,
+    anchor_source: Option<String>,
+) -> Option<Incident> {
+    let failures = group
+        .iter()
+        .filter(|e| e.event_type == EventType::FailedLogin)
+        .count();
+    let mfa_failures = group
+        .iter()
+        .filter(|e| e.event_type == EventType::MfaFailure)
+        .count();
+    let hosts: HashSet<_> = group
+        .iter()
+        .filter(|e| e.event_type == EventType::FailedLogin)
+        .filter_map(|e| e.hostname.as_ref())
+        .collect();
+    let sources: HashSet<_> = group
+        .iter()
+        .filter_map(|e| e.source_ip.as_deref())
+        .collect();
+    let (failure_edges, path_failures, path_hosts, cross) = failure_paths(group);
+    let mut edges = Vec::new();
+    let mut temporal_total = 0.0;
+    let mut entity_total = 0.0;
+    let mut transition_total = 0.0;
+    let mut count = 0.0;
+    for pair in group.windows(2) {
+        let a = &pair[0];
+        let b = &pair[1];
+        let temporal = temporal_strength(a, b);
+        let (entity, mut reasons) = entity_strength(a, b);
+        let tr = transition(a.event_type, b.event_type);
+        if tr > 0.0 {
+            reasons.push(format!("{:?} → {:?}", a.event_type, b.event_type));
+        }
+        if temporal > 0.1 && entity > 0.0 {
+            edges.push(GraphEdge {
+                from: a.id,
+                to: b.id,
+                strength: (0.4 * temporal + 0.4 * entity + 0.2 * tr).min(1.0),
+                reasons,
+            });
+        }
+        temporal_total += temporal;
+        entity_total += entity;
+        transition_total += tr;
+        count += 1.0;
+    }
+    for edge in failure_edges {
+        if !edges
+            .iter()
+            .any(|existing| existing.from == edge.from && existing.to == edge.to)
+        {
+            edges.push(edge);
+        }
+    }
+    let types: HashSet<_> = group
+        .iter()
+        .map(|e| std::mem::discriminant(&e.event_type))
+        .collect();
+    let has = |t: EventType| group.iter().any(|e| e.event_type == t);
+    let full_chain = ordered_attack_chain(group);
+    let mut per_account_host: HashMap<(&str, &str), usize> = HashMap::new();
+    for event in group
+        .iter()
+        .filter(|e| e.event_type == EventType::FailedLogin)
+    {
+        if let (Some(user), Some(host)) = (event.username.as_deref(), event.hostname.as_deref()) {
+            *per_account_host.entry((user, host)).or_default() += 1;
+        }
+    }
+    let brute = per_account_host.values().any(|count| *count >= 6);
+    let distributed = cross >= 1.0;
+    let is_rotating_sources = sources.len() >= 3 && path_failures >= 4;
+
+    let familiar_auth = is_familiar_auth(group, baseline);
+
+    let repeated_mfa = group
+        .iter()
+        .filter(|e| e.event_type == EventType::MfaFailure)
+        .any(|anchor_mfa| {
+            let mfa_in_window = group
+                .iter()
+                .filter(|e| {
+                    e.event_type == EventType::MfaFailure
+                        && e.username == anchor_mfa.username
+                        && (e.timestamp - anchor_mfa.timestamp).num_seconds().abs() <= 300
+                })
+                .count();
+            let mfa_hosts: HashSet<_> = group
+                .iter()
+                .filter(|e| {
+                    e.event_type == EventType::MfaFailure && e.username == anchor_mfa.username
+                })
+                .filter_map(|e| e.hostname.as_deref())
+                .collect();
+            if familiar_auth {
+                // For established familiar users on a single host, up to 3 MFA retries is human error.
+                // Attack patterns exhibit rapid push fatigue (>= 4 retries) or cross-host probing.
+                mfa_in_window >= 4 || (mfa_in_window >= 3 && mfa_hosts.len() > 1)
+            } else {
+                mfa_in_window >= 3
+            }
+        });
+
+    let success_after_failures = group
+        .iter()
+        .filter(|e| e.event_type == EventType::SuccessfulLogin)
+        .any(|login| {
+            let failures_before = group
+                .iter()
+                .filter(|e| {
+                    e.event_type == EventType::FailedLogin
+                        && e.username == login.username
+                        && e.timestamp < login.timestamp
+                        && (login.timestamp - e.timestamp).num_seconds() <= 600
+                })
+                .count();
+            if familiar_auth {
+                // For familiar users on known hosts, 1-2 password typos is routine.
+                // Attack patterns require repeated guessing (>= 4) or cross-host failures before success.
+                failures_before >= 4 || (failures_before >= 2 && hosts.len() > 1)
+            } else {
+                failures_before >= 2
+            }
+        });
+
+    let new_source_success = group.iter().any(|e| {
+        if e.event_type != EventType::SuccessfulLogin {
+            return false;
+        }
+        let Some(user) = e.username.as_deref() else {
+            return false;
+        };
+        baseline.users.get(user).is_some_and(|p| {
+            p.successful_logins >= 3
+                && e.source_ip
+                    .as_ref()
+                    .is_some_and(|ip| !p.source_ips.contains(ip))
+        })
+    });
+
+    if !(brute
+        || distributed
+        || is_rotating_sources
+        || full_chain
+        || repeated_mfa
+        || success_after_failures
+        || (new_source_success && failures > 0)
+        || has(EventType::UnauthorizedAccess))
+    {
+        return None;
+    }
+
+    let rarity = if familiar_auth {
+        0.3
+    } else if full_chain {
+        1.0
+    } else if success_after_failures || repeated_mfa {
+        0.9
+    } else if is_rotating_sources {
+        0.85
+    } else if distributed {
+        0.8
+    } else if brute {
+        0.75
+    } else if new_source_success {
+        0.65
+    } else {
+        0.60
+    };
+    let temporal = if count > 0.0 {
+        temporal_total / count
+    } else {
+        0.0
+    };
+    let entity = if count > 0.0 {
+        entity_total / count
+    } else {
+        0.0
+    };
+    let transition_score = if familiar_auth {
+        0.35
+    } else if full_chain || success_after_failures {
+        1.0
+    } else if repeated_mfa {
+        0.9
+    } else if is_rotating_sources || distributed {
+        0.75
+    } else if brute {
+        0.65
+    } else if new_source_success {
+        0.45
+    } else {
+        transition_total / count.max(1.0)
+    };
+    let behaviour = baseline.deviation(group).max(if familiar_auth {
+        0.0
+    } else if full_chain {
+        0.8
+    } else if success_after_failures || repeated_mfa {
+        0.75
+    } else if is_rotating_sources {
+        0.70
+    } else if distributed {
+        0.65
+    } else if brute || new_source_success {
+        0.50
+    } else {
+        0.3
+    });
+    let bonus = if familiar_auth {
+        0.0
+    } else if full_chain {
+        25.0
+    } else if success_after_failures {
+        20.0
+    } else if repeated_mfa {
+        18.0
+    } else if is_rotating_sources {
+        15.0
+    } else if distributed {
+        8.0
+    } else if brute {
+        12.0
+    } else if new_source_success {
+        8.0
+    } else {
+        0.0
+    };
+    let score = ScoreBreakdown::calculate(
+        rarity,
+        temporal,
+        entity,
+        transition_score,
+        if is_rotating_sources { 1.0 } else { cross },
+        behaviour,
+        bonus,
+    );
+    let source_str = anchor_source
+        .or_else(|| group.first().and_then(|e| e.source_ip.clone()))
+        .unwrap_or_else(|| "unknown".into());
+    let mut reasons = Vec::new();
+    if failures > 0 {
+        reasons.push(format!("{failures} failed logins across cluster"));
+    }
+    if hosts.len() > 1 {
+        reasons.push(format!("activity spans {} distinct hosts", hosts.len()));
+    }
+    if is_rotating_sources {
+        reasons.push(format!(
+            "rotating source IPs: {} distinct sources targeting single identity",
+            sources.len()
+        ));
+    }
+    if distributed {
+        reasons.push(format!(
+            "connected failure path: {path_failures} attempts across {path_hosts} hosts for one account"
+        ));
+    }
+    if full_chain {
+        reasons.push("ordered authentication → privilege → outbound attack chain".into());
+    }
+    if brute {
+        reasons.push("repeated authentication failures in a 10-minute window".into());
+    }
+    if repeated_mfa {
+        reasons.push(format!(
+            "{mfa_failures} failed MFA checks linked to the account"
+        ));
+    }
+    if success_after_failures {
+        reasons.push("completed login after nearby password failures".into());
+    }
+    if new_source_success {
+        reasons
+            .push("completed login from a source absent from established account history".into());
+    }
+    if edges.len() > 1 {
+        reasons.push(format!("{} time-decayed graph links", edges.len()));
+    }
+    if types.len() > 3 {
+        reasons.push("multiple security event types linked".into());
+    }
+    if familiar_auth {
+        reasons.push("known account, source, and hosts; review before containment".into());
+    } else {
+        reasons.push("behavior differs from learned normal activity".into());
+    }
+    let severity = RiskLevel::from_score(score.final_risk);
+    let target = group
+        .iter()
+        .find_map(|e| e.hostname.clone())
+        .unwrap_or_else(|| "unknown host".into());
+    let confidence = (70
+        + if full_chain {
+            24
+        } else if distributed || is_rotating_sources || success_after_failures || repeated_mfa {
+            18
+        } else if new_source_success {
+            8
+        } else {
+            12
+        })
+    .min(99);
+    let recommended_actions = match severity {
+        RiskLevel::Critical => vec![
+            "Block source at the lab gateway for 60 seconds".into(),
+            "Verify the block with a real lab request".into(),
+            "Preserve event evidence".into(),
+        ],
+        RiskLevel::High => vec!["Recommend containment".into(), "Preserve evidence".into()],
+        _ => vec![
+            "Increase monitoring".into(),
+            "Review authentication activity".into(),
+        ],
+    };
+    Some(Incident {
+        id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        source_ip: Some(source_str),
+        target,
+        kind: if distributed || is_rotating_sources {
+            "DISTRIBUTED AUTHENTICATION ATTACK".into()
+        } else if full_chain {
+            "MULTI-STAGE INTRUSION".into()
+        } else if success_after_failures {
+            "SUSPICIOUS SUCCESSFUL LOGIN".into()
+        } else if repeated_mfa {
+            "REPEATED MFA FAILURES".into()
+        } else if new_source_success {
+            "UNUSUAL SUCCESSFUL LOGIN".into()
+        } else if brute {
+            "BRUTE FORCE AUTHENTICATION".into()
+        } else {
+            "UNAUTHORIZED ACCESS".into()
+        },
+        risk: score.final_risk,
+        severity,
+        status: IncidentStatus::Active,
+        confidence,
+        score,
+        reasons,
+        recommended_actions,
+        events: group.to_vec(),
+        edges,
+        response: None,
+    })
+}
+
 pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident> {
     let mut sorted: Vec<_> = events
         .iter()
@@ -193,15 +579,16 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
         .collect();
     sorted.sort_by_key(|e| e.timestamp);
     let mut groups: HashMap<String, Vec<SecurityEvent>> = HashMap::new();
-    for e in sorted {
+    for e in &sorted {
         if let Some(ip) = &e.source_ip {
-            groups.entry(ip.clone()).or_default().push(e);
+            groups.entry(ip.clone()).or_default().push(e.clone());
         }
     }
     let mut incidents = Vec::new();
+    let mut claimed_ids = HashSet::new();
+
+    // Pass 1: Source-anchored correlation (single-source scanning, brute force, multi-stage chains)
     for (source, all) in groups {
-        // No candidate anchor in this source can produce an incident. Skip
-        // the quadratic window search while keeping these events in baseline learning.
         if !all
             .iter()
             .any(|e| suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
@@ -210,7 +597,7 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
         }
         let mut used = HashSet::new();
         for anchor in &all {
-            if used.contains(&anchor.id) {
+            if used.contains(&anchor.id) || claimed_ids.contains(&anchor.id) {
                 continue;
             }
             let group: Vec<_> = all
@@ -227,335 +614,75 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             {
                 continue;
             }
-            let failures = group
-                .iter()
-                .filter(|e| e.event_type == EventType::FailedLogin)
-                .count();
-            let mfa_failures = group
-                .iter()
-                .filter(|e| e.event_type == EventType::MfaFailure)
-                .count();
-            let hosts: HashSet<_> = group
-                .iter()
-                .filter(|e| e.event_type == EventType::FailedLogin)
-                .filter_map(|e| e.hostname.as_ref())
-                .collect();
-            let (failure_edges, path_failures, path_hosts, cross) = failure_paths(&group);
-            let mut edges = Vec::new();
-            let mut temporal_total = 0.0;
-            let mut entity_total = 0.0;
-            let mut transition_total = 0.0;
-            let mut count = 0.0;
-            for pair in group.windows(2) {
-                let a = &pair[0];
-                let b = &pair[1];
-                let temporal = temporal_strength(a, b);
-                let (entity, mut reasons) = entity_strength(a, b);
-                let tr = transition(a.event_type, b.event_type);
-                if tr > 0.0 {
-                    reasons.push(format!("{:?} → {:?}", a.event_type, b.event_type));
+            if let Some(incident) = evaluate_cluster(&group, baseline, Some(source.clone())) {
+                for e in &incident.events {
+                    used.insert(e.id);
+                    claimed_ids.insert(e.id);
                 }
-                if temporal > 0.1 && entity > 0.0 {
-                    edges.push(GraphEdge {
-                        from: a.id,
-                        to: b.id,
-                        strength: (0.4 * temporal + 0.4 * entity + 0.2 * tr).min(1.0),
-                        reasons,
-                    });
-                }
-                temporal_total += temporal;
-                entity_total += entity;
-                transition_total += tr;
-                count += 1.0;
+                incidents.push(incident);
             }
-            for edge in failure_edges {
-                if !edges
-                    .iter()
-                    .any(|existing| existing.from == edge.from && existing.to == edge.to)
-                {
-                    edges.push(edge);
-                }
-            }
-            let types: HashSet<_> = group
-                .iter()
-                .map(|e| std::mem::discriminant(&e.event_type))
-                .collect();
-            let has = |t: EventType| group.iter().any(|e| e.event_type == t);
-            let full_chain = ordered_attack_chain(&group);
-            let mut per_account_host: HashMap<(&str, &str), usize> = HashMap::new();
-            for event in group
-                .iter()
-                .filter(|e| e.event_type == EventType::FailedLogin)
-            {
-                if let (Some(user), Some(host)) =
-                    (event.username.as_deref(), event.hostname.as_deref())
-                {
-                    *per_account_host.entry((user, host)).or_default() += 1;
-                }
-            }
-            let brute = per_account_host.values().any(|count| *count >= 6);
-            let distributed = cross >= 1.0;
-            let repeated_mfa = group
-                .iter()
-                .filter(|e| e.event_type == EventType::MfaFailure)
-                .any(|anchor_mfa| {
-                    group
-                        .iter()
-                        .filter(|e| {
-                            e.event_type == EventType::MfaFailure
-                                && e.username == anchor_mfa.username
-                                && (e.timestamp - anchor_mfa.timestamp).num_seconds().abs() <= 300
-                        })
-                        .count()
-                        >= 3
-                });
-            let success_after_failures = group
-                .iter()
-                .filter(|e| e.event_type == EventType::SuccessfulLogin)
-                .any(|login| {
-                    group
-                        .iter()
-                        .filter(|e| {
-                            e.event_type == EventType::FailedLogin
-                                && e.username == login.username
-                                && e.timestamp < login.timestamp
-                                && (login.timestamp - e.timestamp).num_seconds() <= 600
-                        })
-                        .count()
-                        >= 2
-                });
-            let first_group = group
-                .first()
-                .map(|e| e.timestamp)
-                .unwrap_or(anchor.timestamp);
-            let new_source_success = group.iter().any(|e| {
-                if e.event_type != EventType::SuccessfulLogin {
-                    return false;
-                }
-                let Some(user) = e.username.as_deref() else {
-                    return false;
-                };
-                let previous: Vec<_> = events
-                    .iter()
-                    .filter(|old| {
-                        old.event_type == EventType::SuccessfulLogin
-                            && old.username.as_deref() == Some(user)
-                            && old.timestamp < first_group
-                    })
-                    .collect();
-                previous.len() >= 3 && !previous.iter().any(|old| old.source_ip == e.source_ip)
-            });
-            let familiar_auth = distributed
-                && group
-                    .iter()
-                    .filter(|e| e.event_type == EventType::FailedLogin)
-                    .all(|e| {
-                        e.username
-                            .as_deref()
-                            .and_then(|user| baseline.users.get(user))
-                            .is_some_and(|profile| {
-                                profile.successful_logins >= 3
-                                    && profile.source_ips.contains(&source)
-                                    && e.hostname
-                                        .as_ref()
-                                        .is_some_and(|host| profile.hosts.contains(host))
-                            })
-                    });
-            if !(brute
-                || distributed
-                || full_chain
-                || repeated_mfa
-                || success_after_failures
-                || new_source_success
-                || has(EventType::UnauthorizedAccess))
-            {
-                continue;
-            }
-            let rarity = if familiar_auth {
-                0.3
-            } else if full_chain {
-                1.0
-            } else if success_after_failures || repeated_mfa {
-                0.9
-            } else if new_source_success {
-                0.7
-            } else if distributed {
-                0.8
-            } else if brute {
-                0.75
-            } else {
-                0.65
-            };
-            let temporal = if count > 0.0 {
-                temporal_total / count
-            } else {
-                0.0
-            };
-            let entity = if count > 0.0 {
-                entity_total / count
-            } else {
-                0.0
-            };
-            let transition_score = if familiar_auth {
-                0.35
-            } else if full_chain || success_after_failures {
-                1.0
-            } else if repeated_mfa {
-                0.9
-            } else if new_source_success {
-                0.45
-            } else if distributed {
-                0.75
-            } else if brute {
-                0.65
-            } else {
-                transition_total / count.max(1.0)
-            };
-            let behaviour = baseline.deviation(&group).max(if familiar_auth {
-                0.0
-            } else if full_chain {
-                0.8
-            } else if success_after_failures || repeated_mfa {
-                0.75
-            } else if new_source_success {
-                0.7
-            } else if distributed {
-                0.65
-            } else if brute {
-                0.5
-            } else {
-                0.3
-            });
-            let bonus = if familiar_auth {
-                0.0
-            } else if full_chain {
-                25.0
-            } else if success_after_failures {
-                20.0
-            } else if repeated_mfa {
-                18.0
-            } else if new_source_success {
-                5.0
-            } else if distributed {
-                8.0
-            } else if brute {
-                12.0
-            } else {
-                0.0
-            };
-            let score = ScoreBreakdown::calculate(
-                rarity,
-                temporal,
-                entity,
-                transition_score,
-                cross,
-                behaviour,
-                bonus,
-            );
-            let mut reasons = Vec::new();
-            if failures > 0 {
-                reasons.push(format!("{failures} failed logins from {source}"));
-            }
-            if hosts.len() > 1 {
-                reasons.push(format!("same source across {} hosts", hosts.len()));
-            }
-            if distributed {
-                reasons.push(format!("connected failure path: {path_failures} attempts across {path_hosts} hosts for one account"));
-            }
-            if full_chain {
-                reasons.push("ordered authentication → privilege → outbound attack chain".into());
-            }
-            if brute {
-                reasons.push("repeated authentication failures in a 10-minute window".into());
-            }
-            if repeated_mfa {
-                reasons.push(format!(
-                    "{mfa_failures} failed MFA checks linked to the account and source"
-                ));
-            }
-            if success_after_failures {
-                reasons.push("completed login after nearby password failures".into());
-            }
-            if new_source_success {
-                reasons.push(
-                    "completed login from a source absent from established account history".into(),
-                );
-            }
-            if edges.len() > 1 {
-                reasons.push(format!("{} time-decayed graph links", edges.len()));
-            }
-            if types.len() > 3 {
-                reasons.push("multiple security event types linked".into());
-            }
-            if familiar_auth {
-                reasons.push("known account, source, and hosts; review before containment".into());
-            } else {
-                reasons.push("behavior differs from learned normal activity".into());
-            }
-            let severity = RiskLevel::from_score(score.final_risk);
-            let target = group
-                .iter()
-                .find_map(|e| e.hostname.clone())
-                .unwrap_or_else(|| "unknown host".into());
-            let confidence = (70
-                + if full_chain {
-                    24
-                } else if distributed || success_after_failures || repeated_mfa {
-                    18
-                } else if new_source_success {
-                    8
-                } else {
-                    12
-                })
-            .min(99);
-            let recommended_actions = match severity {
-                RiskLevel::Critical => vec![
-                    "Block source at the lab gateway for 60 seconds".into(),
-                    "Verify the block with a real lab request".into(),
-                    "Preserve event evidence".into(),
-                ],
-                RiskLevel::High => vec!["Recommend containment".into(), "Preserve evidence".into()],
-                _ => vec![
-                    "Increase monitoring".into(),
-                    "Review authentication activity".into(),
-                ],
-            };
-            for e in &group {
-                used.insert(e.id);
-            }
-            incidents.push(Incident {
-                id: Uuid::new_v4(),
-                created_at: Utc::now(),
-                source_ip: Some(source.clone()),
-                target,
-                kind: if distributed {
-                    "DISTRIBUTED AUTHENTICATION ATTACK".into()
-                } else if full_chain {
-                    "MULTI-STAGE INTRUSION".into()
-                } else if success_after_failures {
-                    "SUSPICIOUS SUCCESSFUL LOGIN".into()
-                } else if repeated_mfa {
-                    "REPEATED MFA FAILURES".into()
-                } else if new_source_success {
-                    "UNUSUAL SUCCESSFUL LOGIN".into()
-                } else if brute {
-                    "BRUTE FORCE AUTHENTICATION".into()
-                } else {
-                    "UNAUTHORIZED ACCESS".into()
-                },
-                risk: score.final_risk,
-                severity,
-                status: IncidentStatus::Active,
-                confidence,
-                score,
-                reasons,
-                recommended_actions,
-                events: group,
-                edges,
-                response: None,
-            });
         }
     }
+
+    // Pass 2: Identity-anchored correlation (cross-source attacks targeting single identities, rotating IPs)
+    let mut identity_groups: HashMap<String, Vec<SecurityEvent>> = HashMap::new();
+    for e in &sorted {
+        if claimed_ids.contains(&e.id) {
+            continue;
+        }
+        let matches = match &e.username {
+            Some(user) => {
+                !user.is_empty()
+                    && (suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
+            }
+            None => false,
+        };
+        if matches {
+            identity_groups
+                .entry(e.username.clone().unwrap())
+                .or_default()
+                .push(e.clone());
+        }
+    }
+    for (_user, all_user) in identity_groups {
+        let unique_sources: HashSet<_> = all_user
+            .iter()
+            .filter_map(|e| e.source_ip.as_deref())
+            .collect();
+        if unique_sources.len() < 2 {
+            continue;
+        }
+        let mut used = HashSet::new();
+        for anchor in &all_user {
+            if used.contains(&anchor.id) || claimed_ids.contains(&anchor.id) {
+                continue;
+            }
+            let group: Vec<_> = all_user
+                .iter()
+                .filter(|e| {
+                    (e.timestamp - anchor.timestamp).num_seconds().abs() <= WINDOW_SECS
+                        && !used.contains(&e.id)
+                        && !claimed_ids.contains(&e.id)
+                })
+                .cloned()
+                .collect();
+            let sources_in_group: HashSet<_> = group
+                .iter()
+                .filter_map(|e| e.source_ip.as_deref())
+                .collect();
+            if sources_in_group.len() < 2 {
+                continue;
+            }
+            if let Some(incident) = evaluate_cluster(&group, baseline, None) {
+                for e in &incident.events {
+                    used.insert(e.id);
+                    claimed_ids.insert(e.id);
+                }
+                incidents.push(incident);
+            }
+        }
+    }
+
     incidents.sort_by_key(|a| std::cmp::Reverse(a.risk));
     incidents
 }

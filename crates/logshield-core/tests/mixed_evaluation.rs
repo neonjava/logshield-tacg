@@ -251,7 +251,11 @@ fn cases() -> Vec<Case> {
             vec![event(5, SuccessfulLogin, "travel-device", "app-c", "demo")],
         ),
     ];
-    for name in ["legitimate_password_typos", "legitimate_new_device"] {
+    for name in [
+        "legitimate_password_typos",
+        "legitimate_new_device",
+        "mfa_user_errors",
+    ] {
         set.iter_mut()
             .find(|case| case.name == name)
             .unwrap()
@@ -420,7 +424,47 @@ fn mixed_traffic_comparison_against_stateful_rules() {
         );
     }
     assert_eq!(cases.len(), 16);
-    assert!(tacg.tp > 0 && rules.tp > 0);
+    // Explicit regression assertions protecting detection quality, precision, recall, and safety
+    assert_eq!(
+        tacg.benign_critical, 0,
+        "TACG must never produce critical false positives on benign cases"
+    );
+    assert_eq!(
+        tacg.fp, 0,
+        "TACG must maintain zero false positives on authored test fixtures"
+    );
+    assert!(
+        tacg.tp >= 7,
+        "TACG must catch at least 7 of 9 attacks (TP >= 7)"
+    );
+    assert_eq!(
+        tacg.tn, 7,
+        "TACG must correctly identify all 7 benign scenarios (TN == 7)"
+    );
+    let tacg_precision = tacg.tp as f64 / (tacg.tp + tacg.fp) as f64;
+    let tacg_recall = tacg.tp as f64 / (tacg.tp + tacg.fn_) as f64;
+    let tacg_fpr = tacg.fp as f64 / (tacg.fp + tacg.tn) as f64;
+    assert!(
+        tacg_precision >= 0.95,
+        "TACG precision must be >= 0.95, got {tacg_precision}"
+    );
+    assert!(
+        tacg_recall >= 0.75,
+        "TACG recall must be >= 0.75, got {tacg_recall}"
+    );
+    assert!(tacg_fpr <= 0.05, "TACG FPR must be <= 0.05, got {tacg_fpr}");
+
+    let rules_precision = rules.tp as f64 / (rules.tp + rules.fp) as f64;
+    let rules_fpr = rules.fp as f64 / (rules.fp + rules.tn) as f64;
+    assert!(
+        tacg_precision > rules_precision,
+        "TACG precision ({tacg_precision:.2}) must exceed centralized rules ({rules_precision:.2})"
+    );
+    assert!(
+        tacg_fpr < rules_fpr,
+        "TACG FPR ({tacg_fpr:.2}) must be strictly lower than centralized rules ({rules_fpr:.2})"
+    );
+
     println!("TACG: {}", tacg.summary());
     println!("centralized rules: {}", rules.summary());
 }
