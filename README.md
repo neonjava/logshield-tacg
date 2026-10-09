@@ -1,12 +1,12 @@
 # LogShield TACG
 
-**Remote showcase and local fallback:** see [docs/REMOTE_DEMO.md](docs/REMOTE_DEMO.md). The VPS demonstration uses three Rust replicas, authenticated log agents, real gateway requests, and a dashboard reachable through an SSH tunnel; the same demo works locally if the VPS is unavailable. Developers can integrate the [Rust ingestion SDK](docs/SDK.md) from Git. The source is licensed under [Apache-2.0](LICENSE).
+**Self-hosted security event correlation and a reusable Rust ingestion SDK.** See the [SDK guide](docs/SDK.md), [private deployment guide](docs/DEPLOYMENT.md), and [Apache-2.0 license](LICENSE). The isolated multi-server environment remains available for integration testing.
 
 **AI26CY03 — Log-Based Intrusion Detection**
 
 LogShield TACG is a defensive security-monitoring project. It collects system, application, authentication, and gateway logs; connects related events across time and servers; shows the evidence behind an incident; and verifies a local defensive response. Its detection engine and backend are written in Rust. The React dashboard displays results and offers controlled demonstration tools.
 
-> **Status:** Both the isolated lab and the multi-server application extension pass Rust, frontend, and Docker end-to-end CI checks. They remain demonstration infrastructure, not a production security service. The public SDK is a Git dependency; no crate has been published to crates.io.
+> **Status:** Public source and Git-based SDK. Rust, frontend, and Docker integration checks cover the local environment. Private-network deployment is the first target; representative load, source attribution, tenant isolation, and security operations still need validation before production use. No crate has been published to crates.io.
 
 ## The problem
 
@@ -71,7 +71,7 @@ The ingestion path validates input size and format, never executes log contents,
 - **Rust lab and infrastructure services:** controlled request generation and applications that produce genuine logs.
 - **React/Vite:** SOC views, raw evidence, score breakdown, response proof, and lab controls. It does not perform security detection.
 
-Docker networks isolate the lab. The API is published only on localhost; the gateway, application servers, Redis, and PostgreSQL have no host-facing ports. The project does **not** scan external systems, exploit vulnerabilities, or modify the host firewall. Outside the lab, LogShield should alert by default and use an explicitly configured, authorized adapter for any defensive action. This is a local mentor demo and integration template, **not a production-ready multi-tenant service**.
+Docker networks isolate the lab. The API is published only on localhost; the gateway, application servers, Redis, and PostgreSQL have no host-facing ports. The project does **not** scan external systems, exploit vulnerabilities, or modify the host firewall. Outside the lab, LogShield alerts by default; automatic gateway action is disabled. Non-lab API mode requires an operator token and same-origin browser access. This is a self-hosted integration beta, **not a production-ready multi-tenant service**.
 
 ## Running the verified lab and the extension
 
@@ -113,4 +113,4 @@ The Docker integration test needs the release binaries and Compose image built f
 
 ## Known limitations and next steps
 
-The lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. It is designed for a safe demonstration, not arbitrary network traffic. Operator authentication and trustworthy source attribution are required before use with real organizations. The API still loads a bounded recent event set and recomputes correlations after batches; sustained-volume latency is unmeasured. Future production work includes tenant isolation, secret management, durable agent enrollment and rotation handling, representative labeled-data evaluation, calibrated baselines, incremental correlation, and human-reviewed response policy.
+The lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. It is designed for safe integration testing. Outside lab mode, operator authentication is required, but trustworthy source attribution, TLS termination, network access policy, secret rotation, and audit procedures remain deployment responsibilities. The API still loads a bounded recent event set and recomputes correlations after batches; sustained-volume latency is unmeasured. The direct SDK has no persistent offline queue, and the file agent does not yet fully handle rotation. Future work includes tenant isolation, secret management, agent enrollment, representative labeled-data evaluation, calibrated baselines, incremental correlation, and human-reviewed response policy.

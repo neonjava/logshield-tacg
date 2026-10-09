@@ -4,7 +4,7 @@ LogShield's first public integration is a **Git dependency**, not a crates.io re
 
 ## 1. Run LogShield privately
 
-Follow the [README](../README.md) to start the Docker lab. Its API listens on `127.0.0.1:3000` by default. Do not expose the demo API to the public internet: operator routes and lab controls are not authenticated. For a separate host, use an authorized private network with TLS and operator access controls before sending real logs.
+Follow the [README](../README.md) to start the isolated Docker lab. Its API is published on `127.0.0.1:3000`. For a private self-hosted deployment, set `LAB_MODE=false`, configure `LOGSHIELD_OPERATOR_TOKEN` (24+ random characters), and keep the API behind a TLS-terminating private reverse proxy. Operator routes require `Authorization: Bearer <operator token>`; authenticated ingestion uses separate source tokens. See [private deployment](DEPLOYMENT.md).
 
 ## 2. Register an ingest source
 
@@ -45,18 +45,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     event.result = Some("success".into());
     event.raw_message = "Example application health request".into();
     let receipt = IngestClient::new(endpoint, token).send(&[event]).await?;
-    println!("Queued {} event from {}", receipt.queued, receipt.source);
+    assert!(receipt.durable, "server did not confirm persistence");
+    println!("Stored {} event from {}", receipt.queued, receipt.source);
     Ok(())
 }
 ```
 
 The same source is available as a compilable [example](../crates/logshield-ingest/examples/send_event.rs). With the local API and a registered source running, set `LOGSHIELD_URL=http://127.0.0.1:3000` and `LOGSHIELD_TOKEN` in your terminal, then run `cargo run -p logshield-ingest --example send_event`.
 
-The API accepts **1–100 events per request**, within a **1 MiB request body**. `send` returns an `IngestReceipt` with `queued` and `source`; this acknowledges queueing, not durable storage. Use a stable event ID for retries so SQLite can deduplicate accepted records. `heartbeat()` updates the source's last-seen time. The SDK surfaces HTTP failures through `reqwest::Error`.
+The API accepts **1–100 events per request**, within a **1 MiB request body**. `send` returns an `IngestReceipt` with `queued`, `source`, and `durable`. `durable=true` means the event and incident evidence writes completed in SQLite before the HTTP response. The SDK uses a 15-second request timeout. Keep stable event IDs on retry so SQLite can deduplicate accepted records. `heartbeat()` updates the source's last-seen time. The SDK surfaces HTTP failures through `reqwest::Error`; direct SDK users must supply their own retry queue if they need offline durability.
 
 ## File agent
 
-The included `logshield-agent` tails newline-terminated UTF-8 JSON or supported auth/network log lines from a read-only file. Configure `API_URL`, `INGEST_TOKEN`, `SOURCE_ID`, `LOG_FILE`, and `STATE_FILE`, then run `cargo run -p logshield-ingest --bin logshield-agent`. Keep the state file on durable storage and restrict its permissions. The agent sends batches of at most 100 log lines and resumes at its saved byte offset. It is a prototype: acknowledgement is queue-level, the state file is not written atomically, and robust log rotation, backpressure, mTLS, key rotation, and persistent retry queues remain future work.
+The included `logshield-agent` tails newline-terminated UTF-8 JSON or supported auth/network log lines from a read-only file. Configure `API_URL`, `INGEST_TOKEN`, `SOURCE_ID`, `LOG_FILE`, and `STATE_FILE`, then run `cargo run -p logshield-ingest --bin logshield-agent`. Keep the state file on durable storage and restrict its permissions. The agent sends batches of at most 100 log lines and advances its offset only after a durable API receipt, then atomically replaces and syncs its offset file. If a line exceeds 128 KiB without a newline, the agent exits with an explicit error for operator repair rather than retrying the same line forever. Robust log rotation, mTLS, key rotation, and a persistent outbound queue remain future work.
 
 ## Safety and limits
 
