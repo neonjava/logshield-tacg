@@ -18,13 +18,14 @@ pub async fn init(db: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 pub async fn insert_event(db: &SqlitePool, e: &SecurityEvent) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin().await?;
     let result =
         sqlx::query("INSERT OR IGNORE INTO events(id,timestamp,source_ip,payload) VALUES(?,?,?,?)")
             .bind(e.id.to_string())
             .bind(e.timestamp.to_rfc3339())
             .bind(&e.source_ip)
             .bind(serde_json::to_string(e).unwrap())
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
     if result.rows_affected() == 0 {
         return Ok(false);
@@ -37,9 +38,10 @@ pub async fn insert_event(db: &SqlitePool, e: &SecurityEvent) -> Result<bool, sq
         ("service", &e.service),
     ] {
         if let Some(value) = value {
-            sqlx::query("INSERT INTO entities(kind,value,first_seen,last_seen,event_count) VALUES(?,?,?,?,1) ON CONFLICT(kind,value) DO UPDATE SET last_seen=excluded.last_seen,event_count=event_count+1").bind(kind).bind(value).bind(e.timestamp.to_rfc3339()).bind(e.timestamp.to_rfc3339()).execute(db).await?;
+            sqlx::query("INSERT INTO entities(kind,value,first_seen,last_seen,event_count) VALUES(?,?,?,?,1) ON CONFLICT(kind,value) DO UPDATE SET last_seen=excluded.last_seen,event_count=event_count+1").bind(kind).bind(value).bind(e.timestamp.to_rfc3339()).bind(e.timestamp.to_rfc3339()).execute(&mut *tx).await?;
         }
     }
+    tx.commit().await?;
     Ok(true)
 }
 pub async fn events(db: &SqlitePool) -> Result<Vec<SecurityEvent>, sqlx::Error> {

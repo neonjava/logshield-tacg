@@ -6,7 +6,8 @@ use axum::{
         DefaultBodyLimit, Multipart, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -31,17 +32,29 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+struct WorkItem {
+    events: Vec<SecurityEvent>,
+    persisted: Option<oneshot::Sender<Result<(), String>>>,
+}
+impl WorkItem {
+    fn background(events: Vec<SecurityEvent>) -> Self {
+        Self {
+            events,
+            persisted: None,
+        }
+    }
+}
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
-    tx: mpsc::Sender<Vec<SecurityEvent>>,
+    tx: mpsc::Sender<WorkItem>,
     broadcast: broadcast::Sender<String>,
     processing: Arc<Mutex<()>>,
     response_gate: Arc<Mutex<()>>,
@@ -55,6 +68,7 @@ struct AppState {
     sensor_online: Arc<AtomicBool>,
     offsets: sensor::Offsets,
     ingest_tokens: HashMap<String, String>,
+    operator_token: Option<String>,
 }
 
 #[tokio::main]
@@ -67,6 +81,11 @@ async fn main() {
     let (tx, rx) = mpsc::channel(256);
     let (broadcast, _) = broadcast::channel(512);
     let log_dir = PathBuf::from(std::env::var("LOG_DIR").unwrap_or_else(|_| "./lab-logs".into()));
+    let lab_mode = std::env::var("LAB_MODE").is_ok_and(|value| value == "true");
+    let operator_token = std::env::var("LOGSHIELD_OPERATOR_TOKEN").ok();
+    if !lab_mode && operator_token.as_ref().is_none_or(|token| token.len() < 24) {
+        panic!("LOGSHIELD_OPERATOR_TOKEN must be at least 24 characters in non-lab mode");
+    }
     let state = AppState {
         db: pool,
         tx,
@@ -81,11 +100,12 @@ async fn main() {
             .unwrap(),
         gateway: std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()),
         attacker: std::env::var("ATTACKER_URL").unwrap_or_else(|_| "http://127.0.0.1:8082".into()),
-        lab_mode: std::env::var("LAB_MODE").unwrap_or_else(|_| "true".into()) == "true",
+        lab_mode,
         log_dir: log_dir.clone(),
         sensor_online: Arc::new(AtomicBool::new(false)),
         offsets: Arc::new(Mutex::new(HashMap::new())),
         ingest_tokens: load_ingest_tokens(),
+        operator_token,
     };
     tokio::spawn(worker(state.clone(), rx));
     tokio::spawn(sensor::start(
@@ -94,15 +114,12 @@ async fn main() {
         state.sensor_online.clone(),
         state.offsets.clone(),
     ));
-    let app = Router::new()
-        .route("/api/health", get(health))
+    let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/events", get(events).post(add_event))
         .route("/api/logs/upload", post(upload))
         .route("/api/logs/sample/{name}", get(sample_logs))
         .route("/api/logs/export", get(export_logs))
-        .route("/api/ingest/events", post(ingest_events))
-        .route("/api/ingest/heartbeat", post(ingest_heartbeat))
         .route("/api/infra/status", get(infra_status))
         .route("/api/infra/activities", get(infra_activities))
         .route("/api/infra/request", post(infra_request))
@@ -119,21 +136,58 @@ async fn main() {
         .route("/api/lab/force-failure", post(force_failure))
         .route("/api/lab/clear", post(clear_lab))
         .route("/ws/events", get(ws))
+        .route_layer(middleware::from_fn_with_state(state.clone(), operator_auth));
+    let mut app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/ingest/events", post(ingest_events))
+        .route("/api/ingest/heartbeat", post(ingest_heartbeat))
+        .merge(protected)
         .layer(DefaultBodyLimit::max(1_048_576))
-        .layer(
+        .layer(TraceLayer::new_for_http());
+    if state.lab_mode {
+        app = app.layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        );
+    }
+    let app = app.with_state(state);
     let bind = std::env::var("API_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .expect("API_BIND");
     tracing::info!(%bind,"LogShield API ready");
     axum::serve(listener, app).await.unwrap();
+}
+async fn operator_auth(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    if !state.lab_mode {
+        let expected = state.operator_token.as_deref().unwrap_or_default();
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()));
+        if !authorized {
+            return Err((StatusCode::UNAUTHORIZED, "operator authentication required"));
+        }
+    }
+    Ok(next.run(request).await)
+}
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 fn load_ingest_tokens() -> HashMap<String, String> {
     let mut tokens: HashMap<String, String> = [
@@ -173,75 +227,82 @@ fn load_ingest_tokens() -> HashMap<String, String> {
     );
     tokens
 }
-async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
-    while let Some(batch) = rx.recv().await {
+async fn worker(state: AppState, mut rx: mpsc::Receiver<WorkItem>) {
+    while let Some(work) = rx.recv().await {
         let _guard = state.processing.lock().await;
-        let reset_at = *state.reset_at.lock().await;
-        let mut inserted = false;
-        for e in &batch {
-            if reset_at.is_some_and(|cutoff| {
-                e.timestamp <= cutoff
-                    && e.origin.as_deref().is_some_and(|origin| {
-                        origin == "lab_sensor" || origin.starts_with("agent:")
-                    })
-            }) {
-                continue;
-            }
-            match db::insert_event(&state.db, e).await {
-                Ok(true) => {
-                    inserted = true;
-                    let _ = state
-                        .broadcast
-                        .send(serde_json::json!({"type":"event","event":e}).to_string());
-                }
-                Ok(false) => {}
-                Err(err) => tracing::error!(%err,"event insert failed"),
-            }
+        let result = process_batch(&state, &work.events).await;
+        if let Err(err) = &result {
+            tracing::error!(%err, "batch processing failed");
         }
-        if !inserted {
-            continue;
-        }
-        let all = db::events(&state.db).await.unwrap_or_default();
-        let baseline = Baseline::learn(&all);
-        let existing = db::incidents(&state.db).await.unwrap_or_default();
-        for mut new in correlate(&all, &baseline) {
-            let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
-            if let Some(old) = existing
-                .iter()
-                .find(|i| i.events.iter().any(|e| ids.contains(&e.id)))
-            {
-                if old.response.is_some() {
-                    continue;
-                }
-                new.id = old.id;
-            }
-            if response::eligible(&new)
-                && state.lab_mode
-                && new.events.iter().all(|e| {
-                    e.origin.as_deref().is_some_and(|origin| {
-                        origin == "lab_sensor" || origin.starts_with("agent:")
-                    })
-                })
-            {
-                response::begin(&mut new);
-            }
-            if let Err(err) = db::save_incident(&state.db, &new).await {
-                tracing::error!(%err,"incident save failed");
-                continue;
-            }
-            let _ = state
-                .broadcast
-                .send(serde_json::json!({"type":"incident","incident":new}).to_string());
-            if new.status == IncidentStatus::PendingVerification {
-                let state = state.clone();
-                let id = new.id.to_string();
-                let generation = state.reset_generation.load(Ordering::SeqCst);
-                tokio::spawn(async move {
-                    execute_response(state, id, generation).await;
-                });
-            }
+        if let Some(ack) = work.persisted {
+            let _ = ack.send(result);
         }
     }
+}
+async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), String> {
+    let reset_at = *state.reset_at.lock().await;
+    for e in batch {
+        if reset_at.is_some_and(|cutoff| {
+            e.timestamp <= cutoff
+                && e.origin
+                    .as_deref()
+                    .is_some_and(|origin| origin == "lab_sensor" || origin.starts_with("agent:"))
+        }) {
+            continue;
+        }
+        match db::insert_event(&state.db, e).await {
+            Ok(true) => {
+                let _ = state
+                    .broadcast
+                    .send(serde_json::json!({"type":"event","event":e}).to_string());
+            }
+            Ok(false) => {}
+            Err(err) => return Err(format!("event insert failed: {err}")),
+        }
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let all = db::events(&state.db).await.map_err(|e| e.to_string())?;
+    let baseline = Baseline::learn(&all);
+    let existing = db::incidents(&state.db).await.map_err(|e| e.to_string())?;
+    for mut new in correlate(&all, &baseline) {
+        let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
+        if let Some(old) = existing
+            .iter()
+            .find(|i| i.events.iter().any(|e| ids.contains(&e.id)))
+        {
+            if old.response.is_some() {
+                continue;
+            }
+            new.id = old.id;
+        }
+        if response::eligible(&new)
+            && state.lab_mode
+            && new.events.iter().all(|e| {
+                e.origin
+                    .as_deref()
+                    .is_some_and(|origin| origin == "lab_sensor" || origin.starts_with("agent:"))
+            })
+        {
+            response::begin(&mut new);
+        }
+        if let Err(err) = db::save_incident(&state.db, &new).await {
+            return Err(format!("incident save failed: {err}"));
+        }
+        let _ = state
+            .broadcast
+            .send(serde_json::json!({"type":"incident","incident":new}).to_string());
+        if new.status == IncidentStatus::PendingVerification {
+            let state = state.clone();
+            let id = new.id.to_string();
+            let generation = state.reset_generation.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                execute_response(state, id, generation).await;
+            });
+        }
+    }
+    Ok(())
 }
 async fn execute_response(state: AppState, id: String, generation: u64) {
     let _guard = state.response_gate.lock().await;
@@ -748,7 +809,9 @@ async fn events(State(s): State<AppState>) -> ApiResult<Vec<SecurityEvent>> {
 async fn add_event(State(s): State<AppState>, Json(e): Json<SecurityEvent>) -> ApiResult<Value> {
     let mut e = e;
     e.origin = Some("direct_api".into());
-    s.tx.send(vec![e]).await.map_err(internal)?;
+    s.tx.send(WorkItem::background(vec![e]))
+        .await
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({"queued":1})))
 }
 #[derive(Deserialize)]
@@ -769,8 +832,17 @@ async fn ingest_events(
         e.origin = Some(format!("agent:{source}"));
     }
     let count = batch.events.len();
-    s.tx.send(batch.events).await.map_err(internal)?;
-    Ok(Json(serde_json::json!({"queued":count,"source":source})))
+    let (ack, wait) = oneshot::channel();
+    s.tx.send(WorkItem {
+        events: batch.events,
+        persisted: Some(ack),
+    })
+    .await
+    .map_err(internal)?;
+    wait.await.map_err(internal)?.map_err(internal)?;
+    Ok(Json(
+        serde_json::json!({"queued":count,"source":source,"durable":true}),
+    ))
 }
 async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> ApiResult<Value> {
     let mut batch = Vec::new();
@@ -825,7 +897,9 @@ async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> ApiResul
     }
     let count = batch.len();
     if !batch.is_empty() {
-        s.tx.send(batch).await.map_err(internal)?;
+        s.tx.send(WorkItem::background(batch))
+            .await
+            .map_err(internal)?;
     }
     Ok(Json(
         serde_json::json!({"accepted":count,"rejected":rejected,"duplicates":duplicates,"origin":"manual_upload","automatic_response":false}),
@@ -1151,4 +1225,22 @@ fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 }
 fn bad<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn operator_token_requires_exact_match() {
+        assert!(constant_time_eq(
+            b"a-long-private-token",
+            b"a-long-private-token"
+        ));
+        assert!(!constant_time_eq(
+            b"a-long-private-token",
+            b"a-long-private-tokeN"
+        ));
+        assert!(!constant_time_eq(b"short", b"a-long-private-token"));
+    }
 }

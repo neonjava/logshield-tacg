@@ -1,4 +1,5 @@
-use logshield_core::{event::SecurityEvent, normalizer::parse_line};
+use crate::WorkItem;
+use logshield_core::normalizer::parse_line;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -17,7 +18,7 @@ const FILES: [&str; 4] = ["app-a.log", "app-b.log", "app-c.log", "gateway.log"];
 
 pub async fn start(
     dir: PathBuf,
-    tx: mpsc::Sender<Vec<SecurityEvent>>,
+    tx: mpsc::Sender<WorkItem>,
     online: Arc<AtomicBool>,
     offsets: Offsets,
 ) {
@@ -32,7 +33,7 @@ pub async fn start(
                             match parse_line(text) {
                                 Ok(mut event) => {
                                     event.origin = Some("lab_sensor".into());
-                                    if tx.send(vec![event]).await.is_err() {
+                                    if tx.send(WorkItem::background(vec![event])).await.is_err() {
                                         return;
                                     }
                                 }

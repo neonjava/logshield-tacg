@@ -47,23 +47,63 @@ async fn main() {
                     .iter()
                     .filter_map(|line| parse_line(line).ok())
                     .collect();
-                if events.is_empty() || sdk.send(&events).await.is_ok() {
-                    offset = next_offset;
-                    if let Some(parent) = state.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
+                let accepted = if events.is_empty() {
+                    true
+                } else {
+                    match sdk.send(&events).await {
+                        Ok(receipt) if receipt.durable && receipt.queued == events.len() => true,
+                        Ok(receipt) => {
+                            tracing::warn!(?receipt, "ingest acknowledgement was not durable");
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "log submission failed; retaining offset for retry");
+                            false
+                        }
                     }
-                    if let Err(e) = tokio::fs::write(&state, offset.to_string()).await {
-                        tracing::warn!(%e,"offset save failed");
+                };
+                if accepted {
+                    match save_offset(&state, next_offset).await {
+                        Ok(()) => {
+                            offset = next_offset;
+                            tracing::info!(%source,count=events.len(),"log records submitted");
+                        }
+                        Err(e) => tracing::error!(%e, "offset save failed; batch will be retried"),
                     }
-                    tracing::info!(%source,count=events.len(),"log records submitted");
                 }
             }
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                tracing::error!(%e,"log record exceeds the 128 KiB limit; agent stopped so the operator can repair the source");
+                std::process::exit(1);
+            }
             Err(e) => tracing::warn!(%e,"log read failed"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
+}
+async fn save_offset(path: &PathBuf, offset: u64) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = tokio::fs::File::create(&temporary).await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(offset.to_string().as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, path).await?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 async fn read_batch(path: &PathBuf, offset: u64) -> std::io::Result<(u64, Vec<String>)> {
     let mut file = tokio::fs::File::open(path).await?;
@@ -81,6 +121,12 @@ async fn read_batch(path: &PathBuf, offset: u64) -> std::io::Result<(u64, Vec<St
         .last()
         .map(|(index, _)| index)
     else {
+        if n == 131_072 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("oversized log line at byte offset {start}"),
+            ));
+        }
         return Ok((start, vec![]));
     };
     let consumed = (last_newline + 1) as u64;
@@ -117,6 +163,25 @@ mod tests {
         assert_eq!(first.len(), 100);
         let (_, second) = read_batch(&path, offset).await.unwrap();
         assert_eq!(second.len(), 1);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_reported_instead_of_stalling() {
+        let path = std::env::temp_dir().join(format!("logshield-agent-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, vec![b'x'; 131_073]).await.unwrap();
+        let error = read_batch(&path, 0).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offset_is_replaced_after_sync() {
+        let path = std::env::temp_dir().join(format!("logshield-offset-{}", uuid::Uuid::new_v4()));
+        save_offset(&path, 18).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "18");
+        save_offset(&path, 42).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "42");
         tokio::fs::remove_file(path).await.unwrap();
     }
 }

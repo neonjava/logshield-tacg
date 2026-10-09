@@ -9,6 +9,9 @@ pub fn new_event(event_type: EventType, source: &str, host: &str) -> SecurityEve
 pub struct IngestReceipt {
     pub queued: usize,
     pub source: String,
+    /// True when the API has committed the batch and incident evidence to SQLite.
+    #[serde(default)]
+    pub durable: bool,
 }
 
 /// Reusable, authenticated Rust client for applications and file agents.
@@ -20,12 +23,15 @@ pub struct IngestClient {
 impl IngestClient {
     pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("TLS client configuration"),
             endpoint: endpoint.into(),
             token: token.into(),
         }
     }
-    /// Submit 1–100 events. A receipt means queued by the API, not durably stored yet.
+    /// Submit 1–100 events. Check `receipt.durable` before advancing a source cursor.
     pub async fn send(&self, events: &[SecurityEvent]) -> Result<IngestReceipt, reqwest::Error> {
         self.http
             .post(format!(

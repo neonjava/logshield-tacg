@@ -11,6 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     event.raw_message = "Example application health request".into();
 
     let receipt = IngestClient::new(endpoint, token).send(&[event]).await?;
-    println!("Queued {} event from {}", receipt.queued, receipt.source);
+    println!(
+        "Stored {} event from {} (durable: {})",
+        receipt.queued, receipt.source, receipt.durable
+    );
     Ok(())
 }
