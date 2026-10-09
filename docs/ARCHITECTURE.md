@@ -14,7 +14,7 @@ Compose creates three isolated internal networks: `edge` joins the fixed client 
 
 ## Control and verification plane
 
-For risk >=85 and confidence >=85, the response engine records `ACTION_REQUESTED`, calls gateway `/internal/block`, and records the actual result. It then asks the fixed client to retry a login. The client returns the observed HTTP status and gateway JSON. The response engine requires all three: block applied, HTTP 403, and an incident ID match. Only then is the incident `CONTAINED`. A refused block or nonmatching response produces `RESPONSE_FAILED`. Verification attempts and gateway blocks are stored in separate SQL tables.
+For risk >=85 and rule-based evidence strength >=85, the response engine records `ACTION_REQUESTED`, calls gateway `/internal/block`, and records the actual result. It then asks the fixed client to retry a login. The client returns the observed HTTP status and gateway JSON. The response engine requires all three: block applied, HTTP 403, and an incident ID match. Only then is the incident `CONTAINED`. A refused block or nonmatching response produces `RESPONSE_FAILED`. Verification attempts and gateway blocks are stored in separate SQL tables.
 
 The intentional failure switch makes the gateway return HTTP 503 for `/internal/block`. The verification request then reaches the app and returns HTTP 401, proving containment failed. No host firewall is changed.
 
