@@ -866,3 +866,57 @@ fn benchmark_suite_held_out_evaluation_and_ablation() {
     println!("\nAll held-out evaluation and ablation safety assertions PASSED successfully.");
     println!("================================================================================\n");
 }
+
+#[test]
+fn test_temporal_decay_ablation_filters_sporadic_drift() {
+    // Demonstrates the concrete detection advantage of exponential temporal decay (tau = 90s)
+    // over uniform time-weighting (no temporal decay):
+    //
+    // Consider 5 login failures occurring at intervals of 140 seconds (total span: 560s <= 600s window)
+    // across 3 server replicas by a remote client.
+    //
+    // - Full TACG: With tau = 90s, exp(-140/90) = 0.211 < 0.35. The temporal edges decay below the
+    //   connection threshold, correctly recognizing that slow sporadic failures do not represent
+    //   an automated high-velocity brute force or distributed probe. Result: Clean (0 incidents).
+    //
+    // - Ablation (No Decay): Since all events fall within 600 seconds, uniform weighting treats
+    //   every edge as 1.0 >= 0.35. It connects all 5 failures into an artificial attack path across
+    //   3 hosts, triggering a FALSE ALARM for a distributed attack. Result: False Positive.
+    let t0 = Utc::now();
+    let hosts = ["infra-a", "infra-b", "infra-c", "infra-a", "infra-b"];
+    let mut drift_events = Vec::new();
+    for (i, host) in hosts.iter().enumerate() {
+        let mut e = SecurityEvent::new(
+            EventType::FailedLogin,
+            t0 + Duration::seconds((i * 140) as i64),
+            "198.51.100.200",
+            host,
+        );
+        e.username = Some("alice".into());
+        drift_events.push(e);
+    }
+
+    let full_incidents = correlate_with_config(
+        &drift_events,
+        &Baseline::default(),
+        &CorrelationConfig::full(),
+    );
+    assert!(
+        full_incidents.is_empty(),
+        "Full TACG with temporal decay must suppress sporadic drift over 140s intervals"
+    );
+
+    let no_decay_incidents = correlate_with_config(
+        &drift_events,
+        &Baseline::default(),
+        &CorrelationConfig::no_temporal_decay(),
+    );
+    assert!(
+        !no_decay_incidents.is_empty(),
+        "No-Decay ablation must falsely trigger on sporadic failures due to uniform edge weighting"
+    );
+    assert_eq!(
+        no_decay_incidents[0].kind, "DISTRIBUTED AUTHENTICATION ATTACK",
+        "No-decay ablation falsely misclassifies slow drift as a distributed attack"
+    );
+}

@@ -69,6 +69,7 @@ struct AppState {
     offsets: sensor::Offsets,
     ingest_tokens: HashMap<String, String>,
     operator_token: Option<String>,
+    viewer_token: Option<String>,
 }
 
 #[tokio::main]
@@ -83,8 +84,19 @@ async fn main() {
     let log_dir = PathBuf::from(std::env::var("LOG_DIR").unwrap_or_else(|_| "./lab-logs".into()));
     let lab_mode = std::env::var("LAB_MODE").is_ok_and(|value| value == "true");
     let operator_token = std::env::var("LOGSHIELD_OPERATOR_TOKEN").ok();
+    let viewer_token = std::env::var("LOGSHIELD_VIEWER_TOKEN").ok();
     if !lab_mode && operator_token.as_ref().is_none_or(|token| token.len() < 24) {
         panic!("LOGSHIELD_OPERATOR_TOKEN must be at least 24 characters in non-lab mode");
+    }
+    if !lab_mode && viewer_token.as_ref().is_some_and(|token| token.len() < 24) {
+        panic!("LOGSHIELD_VIEWER_TOKEN must be at least 24 characters");
+    }
+    if !lab_mode
+        && viewer_token
+            .as_ref()
+            .is_some_and(|token| Some(token) == operator_token.as_ref())
+    {
+        panic!("viewer and operator tokens must differ");
     }
     let state = AppState {
         db: pool,
@@ -106,6 +118,7 @@ async fn main() {
         offsets: Arc::new(Mutex::new(HashMap::new())),
         ingest_tokens: load_ingest_tokens(),
         operator_token,
+        viewer_token,
     };
     tokio::spawn(worker(state.clone(), rx));
     tokio::spawn(sensor::start(
@@ -166,13 +179,29 @@ async fn operator_auth(
     next: Next,
 ) -> impl IntoResponse {
     if !state.lab_mode {
-        let expected = state.operator_token.as_deref().unwrap_or_default();
-        let authorized = request
+        let provided = request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()));
+            .and_then(|value| value.strip_prefix("Bearer "));
+        let operator = provided.is_some_and(|token| {
+            constant_time_eq(
+                token.as_bytes(),
+                state
+                    .operator_token
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )
+        });
+        let viewer = provided.is_some_and(|token| {
+            state
+                .viewer_token
+                .as_deref()
+                .is_some_and(|expected| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+        });
+        let read_only = request.method() == axum::http::Method::GET;
+        let authorized = operator || (viewer && read_only);
         if !authorized {
             return Err((StatusCode::UNAUTHORIZED, "operator authentication required"));
         }
@@ -267,13 +296,20 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
     let existing = db::incidents(&state.db).await.map_err(|e| e.to_string())?;
     // Enforce explicit training boundary: only events older than the 600s active correlation window
     // can train the baseline, strictly preventing active evaluation events from leaking into profiles.
-    let latest_ts = all.iter().map(|e| e.timestamp).max();
-    let cutoff = latest_ts.map(|ts| ts - chrono::Duration::seconds(600));
+    // Use the collector clock. An attacker-controlled future timestamp must never
+    // advance the training boundary and make recent observations look historical.
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(600);
     let incident_event_ids: std::collections::HashSet<_> = existing
         .iter()
         .flat_map(|i| i.events.iter().map(|e| e.id))
         .collect();
-    let baseline = Baseline::learn_with_cutoff(&all, cutoff, Some(&incident_event_ids));
+    // Historical success is not independent proof of benign activity. Private
+    // deployments use a cold baseline until a reviewed promotion store exists.
+    let baseline = if state.lab_mode {
+        Baseline::learn_with_cutoff(&all, Some(cutoff), Some(&incident_event_ids))
+    } else {
+        Baseline::default()
+    };
     for mut new in correlate(&all, &baseline) {
         let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
         if let Some(old) = existing

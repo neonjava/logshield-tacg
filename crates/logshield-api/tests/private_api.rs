@@ -39,6 +39,10 @@ impl Server {
             .env("LOG_DIR", directory.join("logs"))
             .env("LOGSHIELD_OPERATOR_TOKEN", operator)
             .env(
+                "LOGSHIELD_VIEWER_TOKEN",
+                "private-test-viewer-token-32chars",
+            )
+            .env(
                 "LOGSHIELD_INGEST_TOKENS",
                 format!(r#"{{"private-app":"{source}"}}"#),
             )
@@ -144,6 +148,30 @@ async fn private_mode_auth_ingest_and_restart() {
     );
     assert_eq!(websocket_status(port, None).await, 401);
     assert_eq!(websocket_status(port, Some(&operator)).await, 101);
+    assert_eq!(
+        websocket_status(port, Some("private-test-viewer-token-32chars")).await,
+        101
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/api/events"))
+            .bearer_auth("private-test-viewer-token-32chars")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/api/lab/clear"))
+            .bearer_auth("private-test-viewer-token-32chars")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         client
             .post(format!("{base}/api/lab/clear"))

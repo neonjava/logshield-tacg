@@ -400,11 +400,42 @@ fn evaluate_cluster(
     let distributed = cross >= 1.0;
     let is_rotating_sources = sources.len() >= 3 && path_failures >= 4;
 
+    let distinct_failed_users: HashSet<&str> = group
+        .iter()
+        .filter(|e| e.event_type == EventType::FailedLogin)
+        .filter_map(|e| e.username.as_deref())
+        .collect();
+    let spray = distinct_failed_users.len() >= 6 && failures >= 6;
+
     let familiar_auth = if config.baseline_familiarity {
         is_familiar_auth(group, baseline)
     } else {
         false
     };
+
+    // If a password spray is identified, connect consecutive failures from the same source
+    if config.graph_edges && spray && !familiar_auth {
+        let failure_events: Vec<_> = group
+            .iter()
+            .filter(|e| e.event_type == EventType::FailedLogin)
+            .collect();
+        for pair in failure_events.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            let temporal = temporal_cfg(a, b, config);
+            if temporal >= 0.20 && !edges.iter().any(|e| e.from == a.id && e.to == b.id) {
+                edges.push(GraphEdge {
+                    from: a.id,
+                    to: b.id,
+                    strength: (0.6 * temporal + 0.4).min(1.0),
+                    reasons: vec![
+                        "same source".into(),
+                        "cross-account password spray probe".into(),
+                    ],
+                });
+            }
+        }
+    }
 
     let repeated_mfa = group
         .iter()
@@ -471,9 +502,12 @@ fn evaluate_cluster(
         })
     });
 
+    let is_spray_attack = spray && !familiar_auth;
+
     if !(brute
         || distributed
         || is_rotating_sources
+        || is_spray_attack
         || full_chain
         || repeated_mfa
         || success_after_failures
@@ -489,7 +523,7 @@ fn evaluate_cluster(
         1.0
     } else if success_after_failures || repeated_mfa {
         0.9
-    } else if is_rotating_sources {
+    } else if is_rotating_sources || is_spray_attack {
         0.85
     } else if distributed {
         0.8
@@ -524,7 +558,7 @@ fn evaluate_cluster(
         1.0
     } else if repeated_mfa {
         0.9
-    } else if is_rotating_sources || distributed {
+    } else if is_rotating_sources || distributed || is_spray_attack {
         0.75
     } else if brute {
         0.65
@@ -544,7 +578,7 @@ fn evaluate_cluster(
         0.8
     } else if success_after_failures || repeated_mfa {
         0.75
-    } else if is_rotating_sources {
+    } else if is_rotating_sources || is_spray_attack {
         0.70
     } else if distributed {
         0.65
@@ -563,6 +597,8 @@ fn evaluate_cluster(
         18.0
     } else if is_rotating_sources {
         15.0
+    } else if is_spray_attack {
+        14.0
     } else if distributed {
         8.0
     } else if brute {
@@ -577,7 +613,11 @@ fn evaluate_cluster(
         temporal,
         entity,
         transition_score,
-        if is_rotating_sources { 1.0 } else { cross },
+        if is_rotating_sources || is_spray_attack {
+            1.0
+        } else {
+            cross
+        },
         behaviour,
         bonus,
     );
@@ -595,6 +635,12 @@ fn evaluate_cluster(
         reasons.push(format!(
             "rotating source IPs: {} distinct sources targeting single identity",
             sources.len()
+        ));
+    }
+    if is_spray_attack {
+        reasons.push(format!(
+            "password spray attack: {failures} failures across {} distinct targeted accounts",
+            distinct_failed_users.len()
         ));
     }
     if distributed {
@@ -639,7 +685,12 @@ fn evaluate_cluster(
     let confidence = (70
         + if full_chain {
             24
-        } else if distributed || is_rotating_sources || success_after_failures || repeated_mfa {
+        } else if distributed
+            || is_rotating_sources
+            || is_spray_attack
+            || success_after_failures
+            || repeated_mfa
+        {
             18
         } else if new_source_success {
             8
@@ -666,6 +717,8 @@ fn evaluate_cluster(
         target,
         kind: if distributed || is_rotating_sources {
             "DISTRIBUTED AUTHENTICATION ATTACK".into()
+        } else if is_spray_attack {
+            "PASSWORD SPRAY ATTACK".into()
         } else if full_chain {
             "MULTI-STAGE INTRUSION".into()
         } else if success_after_failures {
@@ -1038,6 +1091,62 @@ mod tests {
         assert!(
             without_ident.is_empty(),
             "Ablation without identity correlation must ignore cross-source accounts"
+        );
+    }
+    #[test]
+    fn password_spray_attack_detected() {
+        let mut events = Vec::new();
+        let spray_ip = "198.51.100.99";
+        for i in 0..7 {
+            let mut e = auth_event(
+                EventType::FailedLogin,
+                i * 5,
+                spray_ip,
+                if i % 2 == 0 { "infra-a" } else { "infra-b" },
+            );
+            e.username = Some(format!("user_{}", i));
+            events.push(e);
+        }
+        let incidents = correlate(&events, &Baseline::default());
+        assert!(!incidents.is_empty(), "Password spray must be detected");
+        assert_eq!(incidents[0].kind, "PASSWORD SPRAY ATTACK");
+        assert!(incidents[0].risk >= 70);
+    }
+    #[test]
+    fn temporal_decay_distinguishes_rapid_burst_from_slow_drift() {
+        // Slow sporadic failures spaced 140s apart (total span: 560s within 600s window)
+        // With tau = 90s, exp(-140/90) = 0.21 < 0.35, so edges decay below threshold.
+        // Full TACG does NOT link them into a connected attack path.
+        // However, no_temporal_decay treats every gap <= 600s as 1.0, falsely linking them.
+        let mut slow_events = Vec::new();
+        for i in 0..5 {
+            let mut e = auth_event(
+                EventType::FailedLogin,
+                i * 140,
+                "192.168.1.50",
+                ["infra-a", "infra-b", "infra-c", "infra-a", "infra-b"][i as usize],
+            );
+            e.username = Some("alice".into());
+            slow_events.push(e);
+        }
+        let full_incidents = correlate_with_config(
+            &slow_events,
+            &Baseline::default(),
+            &CorrelationConfig::full(),
+        );
+        assert!(
+            full_incidents.is_empty(),
+            "Full TACG must decay slow sporadic failures below connection threshold"
+        );
+
+        let no_decay_incidents = correlate_with_config(
+            &slow_events,
+            &Baseline::default(),
+            &CorrelationConfig::no_temporal_decay(),
+        );
+        assert!(
+            !no_decay_incidents.is_empty(),
+            "Ablated TACG without temporal decay falsely links slow drift into an attack"
         );
     }
 }

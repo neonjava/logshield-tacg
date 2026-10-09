@@ -15,9 +15,25 @@ pub enum RiskLevel {
 pub enum IncidentStatus {
     Active,
     Monitoring,
+    AwaitingApproval,
     PendingVerification,
     Contained,
     ResponseFailed,
+    Expired,
+    RolledBack,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResponseState {
+    Detected,
+    AwaitingApproval,
+    ResponseRequested,
+    ResponseApplied,
+    VerificationPending,
+    Contained,
+    ResponseFailed,
+    Expired,
+    RolledBack,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphEdge {
@@ -57,6 +73,8 @@ pub struct ResponseRecord {
     pub evidence: Vec<Uuid>,
     #[serde(default)]
     pub proof: Vec<ResponseStep>,
+    #[serde(default)]
+    pub state: Option<ResponseState>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseStep {

@@ -7,8 +7,8 @@ This is the first supported deployment direction for LogShield TACG. It is an in
 - Keep `API_BIND` on `127.0.0.1:3000` unless the API is on a private interface behind a firewall or authenticated reverse proxy. Do not publish the API or lab gateway directly to the internet.
 - Set `LAB_MODE=false`. This disables lab traffic controls and automated gateway action. The API refuses to start unless `LOGSHIELD_OPERATOR_TOKEN` is at least 24 characters.
 - Set a distinct, random ingestion token for each source using `LOGSHIELD_INGEST_TOKENS`. Keep source tokens and the operator token in a secret store or restricted environment file; rotate them after exposure.
-- Put TLS and operator authentication at a trusted reverse proxy when serving the browser. The proxy must remove any client-supplied `Authorization` header before injecting the operator token. Serve dashboard and API on the same origin; non-lab mode does not enable cross-origin browser requests. WebSocket upgrades must also pass through the proxy.
-- Allow health checks to `/api/health` without an operator token. `/api/ingest/events` and `/api/ingest/heartbeat` require a registered source token. Other API and WebSocket routes require `Authorization: Bearer <operator token>`.
+- Put TLS and user authentication at a trusted reverse proxy when serving the browser. The proxy must remove any client-supplied `Authorization` header before injecting a **viewer** token for read-only dashboard access. Never inject the operator token into an unaudited browser session. Serve dashboard and API on the same origin; WebSocket upgrades must pass through the proxy. This proxy model remains untested as a complete deployment.
+- Allow health checks to `/api/health` without a token. `/api/ingest/events` and `/api/ingest/heartbeat` require a registered source token. Protected GET and WebSocket routes accept `Authorization: Bearer <viewer or operator token>`; writes require the operator token. Browser WebSockets cannot attach arbitrary bearer headers directly, so use the trusted proxy. Never send tokens in query parameters.
 
 ## Minimal API configuration
 
@@ -17,6 +17,7 @@ LAB_MODE=false
 API_BIND=127.0.0.1:3000
 DATABASE_URL=sqlite:///restricted/path/logshield.db?mode=rwc
 LOGSHIELD_OPERATOR_TOKEN=<unique random value, at least 24 characters>
+LOGSHIELD_VIEWER_TOKEN=<different random value, at least 24 characters, optional>
 LOGSHIELD_INGEST_TOKENS={"web-1":"<different random value, at least 24 characters>"}
 ```
 

@@ -1,31 +1,60 @@
 use crate::event::{EventType, SecurityEvent};
 use chrono::{DateTime, Timelike, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baseline {
+    pub version: u64,
     pub users: HashMap<String, UserProfile>,
     pub common_services: HashSet<String>,
     pub normal_events_per_minute: f64,
+    pub quarantine_seconds: i64,
+    pub min_quarantine_observations: usize,
+    pub frozen: bool,
+    pub quarantined: HashMap<String, QuarantinedProfile>,
 }
 
 impl Default for Baseline {
     fn default() -> Self {
         Self {
+            version: 1,
             users: HashMap::new(),
             common_services: HashSet::new(),
             normal_events_per_minute: 10.0,
+            quarantine_seconds: 3600,
+            min_quarantine_observations: 3,
+            frozen: false,
+            quarantined: HashMap::new(),
         }
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     pub hours: HashSet<u32>,
     pub hosts: HashSet<String>,
     pub source_ips: HashSet<String>,
     pub successful_logins: usize,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QuarantinedProfile {
+    pub candidate_source_ips: HashMap<String, (DateTime<Utc>, usize)>,
+    pub candidate_hosts: HashMap<String, (DateTime<Utc>, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineSnapshot {
+    pub version: u64,
+    pub created_at: DateTime<Utc>,
+    pub quarantine_seconds: i64,
+    pub min_quarantine_observations: usize,
+    pub frozen: bool,
+    pub users: HashMap<String, UserProfile>,
+    pub common_services: HashSet<String>,
+    pub normal_events_per_minute: f64,
 }
 
 impl Baseline {
@@ -89,12 +118,15 @@ impl Baseline {
     }
 
     /// Safely update an existing baseline with a newly verified, non-incident event.
-    /// Returns false if the event is rejected (e.g. suspicious type or active incident association).
+    /// Returns false if the event is rejected (e.g. frozen baseline, suspicious type, or active incident association).
     pub fn safe_update(
         &mut self,
         event: &SecurityEvent,
         active_incident_event_ids: &HashSet<Uuid>,
     ) -> bool {
+        if self.frozen {
+            return false;
+        }
         if active_incident_event_ids.contains(&event.id) {
             return false;
         }
@@ -125,7 +157,113 @@ impl Baseline {
                 p.source_ips.insert(ip.clone());
             }
         }
+        self.version += 1;
         true
+    }
+
+    /// Produce an immutable snapshot of the current baseline state.
+    pub fn snapshot(&self) -> BaselineSnapshot {
+        BaselineSnapshot {
+            version: self.version,
+            created_at: Utc::now(),
+            quarantine_seconds: self.quarantine_seconds,
+            min_quarantine_observations: self.min_quarantine_observations,
+            frozen: self.frozen,
+            users: self.users.clone(),
+            common_services: self.common_services.clone(),
+            normal_events_per_minute: self.normal_events_per_minute,
+        }
+    }
+
+    /// Restore baseline profiles from a previously verified snapshot.
+    pub fn restore_snapshot(&mut self, snapshot: BaselineSnapshot) {
+        self.version = snapshot.version + 1;
+        self.users = snapshot.users;
+        self.common_services = snapshot.common_services;
+        self.normal_events_per_minute = snapshot.normal_events_per_minute;
+        self.quarantine_seconds = snapshot.quarantine_seconds;
+        self.min_quarantine_observations = snapshot.min_quarantine_observations;
+        self.frozen = snapshot.frozen;
+        self.quarantined.clear();
+    }
+
+    /// Freeze the baseline to prevent any modifications (e.g. during active incident response or audit).
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
+    /// Unfreeze the baseline to resume safe updates.
+    pub fn unfreeze(&mut self) {
+        self.frozen = false;
+    }
+
+    /// Check if the baseline is currently frozen.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// Record a candidate observation into quarantine rather than promoting immediately.
+    pub fn record_quarantine_observation(
+        &mut self,
+        user: &str,
+        ip: Option<&str>,
+        host: Option<&str>,
+        now: DateTime<Utc>,
+    ) {
+        if self.frozen {
+            return;
+        }
+        let q = self.quarantined.entry(user.to_string()).or_default();
+        if let Some(ip_addr) = ip {
+            let entry = q
+                .candidate_source_ips
+                .entry(ip_addr.to_string())
+                .or_insert((now, 0));
+            entry.1 += 1;
+        }
+        if let Some(hostname) = host {
+            let entry = q
+                .candidate_hosts
+                .entry(hostname.to_string())
+                .or_insert((now, 0));
+            entry.1 += 1;
+        }
+    }
+
+    /// Promote quarantined candidate IPs and hosts that satisfy the quarantine duration and observation thresholds.
+    pub fn promote_quarantined(&mut self, now: DateTime<Utc>) -> usize {
+        if self.frozen {
+            return 0;
+        }
+        let mut promoted_count = 0;
+        let quarantine_secs = self.quarantine_seconds;
+        let min_obs = self.min_quarantine_observations;
+
+        for (user, q) in &mut self.quarantined {
+            let p = self.users.entry(user.clone()).or_default();
+            q.candidate_source_ips.retain(|ip, (first_seen, obs)| {
+                if (now - *first_seen).num_seconds() >= quarantine_secs && *obs >= min_obs {
+                    p.source_ips.insert(ip.clone());
+                    promoted_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            q.candidate_hosts.retain(|host, (first_seen, obs)| {
+                if (now - *first_seen).num_seconds() >= quarantine_secs && *obs >= min_obs {
+                    p.hosts.insert(host.clone());
+                    promoted_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if promoted_count > 0 {
+            self.version += 1;
+        }
+        promoted_count
     }
 
     pub fn deviation(&self, events: &[SecurityEvent]) -> f64 {
@@ -252,5 +390,90 @@ mod tests {
             "unknown_user",
         );
         assert_eq!(baseline.deviation(&[e]), 0.0);
+    }
+
+    #[test]
+    fn test_baseline_snapshot_and_restore() {
+        let mut baseline = Baseline::default();
+        let t0 = Utc::now();
+        let e = make_test_event(
+            t0,
+            EventType::SuccessfulLogin,
+            "10.0.0.5",
+            "host-1",
+            "charlie",
+        );
+        assert!(baseline.safe_update(&e, &HashSet::new()));
+        assert_eq!(baseline.version, 2);
+
+        let snap = baseline.snapshot();
+        assert_eq!(snap.version, 2);
+        assert!(snap.users.contains_key("charlie"));
+
+        let mut restored = Baseline::default();
+        restored.restore_snapshot(snap);
+        assert_eq!(restored.version, 3);
+        assert!(restored.users.contains_key("charlie"));
+    }
+
+    #[test]
+    fn test_baseline_freeze_blocks_updates() {
+        let mut baseline = Baseline::default();
+        baseline.freeze();
+        assert!(baseline.is_frozen());
+
+        let t0 = Utc::now();
+        let e = make_test_event(
+            t0,
+            EventType::SuccessfulLogin,
+            "10.0.0.5",
+            "host-1",
+            "charlie",
+        );
+        assert!(!baseline.safe_update(&e, &HashSet::new()));
+        assert!(!baseline.users.contains_key("charlie"));
+
+        baseline.unfreeze();
+        assert!(!baseline.is_frozen());
+        assert!(baseline.safe_update(&e, &HashSet::new()));
+        assert!(baseline.users.contains_key("charlie"));
+    }
+
+    #[test]
+    fn test_quarantine_promotion_lifecycle() {
+        let mut baseline = Baseline {
+            quarantine_seconds: 60,
+            min_quarantine_observations: 2,
+            ..Default::default()
+        };
+        let t0 = Utc::now();
+
+        // Observation 1: enters quarantine
+        baseline.record_quarantine_observation("alice", Some("192.168.1.50"), Some("srv-1"), t0);
+        let promoted = baseline.promote_quarantined(t0);
+        assert_eq!(
+            promoted, 0,
+            "Should not promote before duration and min observations"
+        );
+
+        // Observation 2: count met, but time duration not elapsed
+        baseline.record_quarantine_observation(
+            "alice",
+            Some("192.168.1.50"),
+            Some("srv-1"),
+            t0 + Duration::seconds(10),
+        );
+        let promoted = baseline.promote_quarantined(t0 + Duration::seconds(10));
+        assert_eq!(
+            promoted, 0,
+            "Should not promote before quarantine_seconds has elapsed"
+        );
+
+        // After quarantine_seconds has elapsed:
+        let promoted = baseline.promote_quarantined(t0 + Duration::seconds(65));
+        assert_eq!(promoted, 2, "Should promote both IP and host");
+        let alice = baseline.users.get("alice").unwrap();
+        assert!(alice.source_ips.contains("192.168.1.50"));
+        assert!(alice.hosts.contains("srv-1"));
     }
 }

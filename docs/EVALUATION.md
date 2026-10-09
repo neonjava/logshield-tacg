@@ -84,14 +84,14 @@ Run:
 cargo test -p logshield-core --test benchmark_suite -- --nocapture
 ```
 
-To validate TACG beyond small hand-crafted fixtures, we created an independent synthetic benchmark generator with deterministic pseudo-random network jitter (±1–3s), diverse attack patterns, and background web traffic (10–20 requests per scenario).
+To test TACG beyond small hand-crafted fixtures, we created a separate synthetic benchmark generator with deterministic pseudo-random network jitter (±1–3s), diverse attack patterns, and background web traffic (10–20 requests per scenario). It shares authored attack families with development and is not an independent field dataset.
 
 ### 3.1 Strict Dataset Separation & Zero-Leakage Validation
 To ensure complete scientific rigor:
 1. **Validation Set (30 scenarios, seeds 60001–60005):** Executed as a preliminary test (`benchmark_suite_validation_and_leakage_check`) to verify pipeline mechanics and enforce explicit zero-leakage assertions:
    - For every evaluation event, assertions verify that novel test IP addresses (e.g., `198.51.100.88`) are **never** present in the user profile learned by `Baseline::learn(&s.baseline_history)`.
    - Benign critical containment is asserted to be strictly 0.
-2. **Held-Out Test Set (60 scenarios, seeds 10001–50005):** A strictly independent evaluation covering 12 scenario families:
+2. **Held-Out Synthetic Test Set (60 scenarios, seeds 10001–50005):** A different seed set covering 12 authored scenario families:
    - **Benign Families (25 scenarios):** `BenignRoutineUser` (routine password typos before login), `BenignNatOffice` (5 employees sharing corporate NAT egress), `BenignMfaRetry` (human-paced TOTP retries), `BenignTravelDevice` (single new-source login), `BenignBurstTraffic` (ambient high-frequency web traffic).
    - **Attack Families (35 scenarios):** `AttackDistributedBruteforce`, `AttackRotatingSources`, `AttackPasswordSpray`, `AttackMfaPushFatigue`, `AttackMultistageKillchain`, `AttackSuccessAfterSpray`, `AttackInterleavedComposite`.
 
@@ -109,11 +109,11 @@ Rather than evaluating an arbitrary separate script, all ablated models are run 
 
 | Detector Variant | TP / 35 | FP / 25 | TN / 25 | FN / 35 | Precision | Recall | F1 Score | FPR | Benign Criticals | Median Delay |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **1. Full TACG (Graph + Baseline)** | **30** | **0** | **25** | **5** | **1.000** | **0.857** | **0.923** | **0.000** | **0** | **25s** |
+| **1. Full TACG (Graph + Baseline)** | **35** | **0** | **25** | **0** | **1.000** | **1.000** | **1.000** | **0.000** | **0** | **25s** |
 | **2. Ablation: No Graph Edges (Flat Counters)** | 35 | 5 | 20 | 0 | 0.875 | 1.000 | 0.933 | 0.200 | 0 | 25s |
-| **3. Ablation: No Baseline (Cold-Start)** | 30 | 10 | 15 | 5 | 0.750 | 0.857 | 0.800 | 0.400 | 10 | 26s |
-| **4. Ablation: No Temporal Decay (Uniform Edges)** | 30 | 0 | 25 | 5 | 1.000 | 0.857 | 0.923 | 0.000 | 0 | 25s |
-| **5. Ablation: No Identity Correlation** | 25 | 0 | 25 | 10 | 1.000 | 0.714 | 0.833 | 0.000 | 0 | 26s |
+| **3. Ablation: No Baseline (Cold-Start)** | 35 | 10 | 15 | 0 | 0.778 | 1.000 | 0.875 | 0.400 | 10 | 26s |
+| **4. Ablation: No Temporal Decay (Uniform Edges)** | 35 | 0 | 25 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 0 | 25s |
+| **5. Ablation: No Identity Correlation** | 30 | 0 | 25 | 5 | 1.000 | 0.857 | 0.923 | 0.000 | 0 | 25s |
 | **6. Stateful Centralized Rules Engine** | 25 | 10 | 15 | 10 | 0.714 | 0.714 | 0.714 | 0.400 | 0 | 0s |
 
 ### Full TACG Confusion Matrix
@@ -121,7 +121,7 @@ Rather than evaluating an arbitrary separate script, all ablated models are run 
 ```
                   Predicted Negative    Predicted Positive
 Actual Negative:  TN = 25                 FP = 0
-Actual Positive:  FN = 5                  TP = 30
+Actual Positive:  FN = 0                  TP = 35
 ```
 
 ### In-Depth Ablation Findings
@@ -133,14 +133,16 @@ Actual Positive:  FN = 5                  TP = 30
 2. **Behavioral Baseline Prevents Catastrophic False Critical Containment:**
    - When baseline familiarity is disabled (`No Baseline`), the detector flags **10 false positives**, all 10 of which escalate to **Critical** severity (`Benign Criticals = 10`).
    - Without historical baseline context, routine password typos (`BenignRoutineUser`) and human-paced MFA retries (`BenignMfaRetry`) look identical to external brute-force probes, triggering unjustified automated containment.
-   - Full TACG discounts familiar user mistakes, guaranteeing **0 false critical alerts**.
+   - Full TACG had **0 false critical alerts in these authored cases**. This is not a guarantee for field traffic. Private mode currently starts with an empty trusted baseline pending an operator approval workflow.
 
-3. **Identity Correlation Captures Rotating IP Botnets (+14.3% Recall):**
-   - When Pass 2 identity correlation is disabled (`No Identity Correlation`), recall plummets from **85.7% (30/35) to 71.4% (25/35)**, and false negatives double from 5 to 10.
+3. **Identity Correlation Captures Rotating IP Botnets (+14.3 percentage points of recall):**
+   - When Pass 2 identity correlation is disabled (`No Identity Correlation`), recall falls from **100% (35/35) to 85.7% (30/35)**, with five missed attacks in this set.
    - Pass 1 alone is completely blind to distributed credential stuffing botnets (`AttackRotatingSources`) where each request originates from a distinct IP address. Pass 2 groups residual events by targeted identity across sources, catching all 5 rotating attacks.
 
 4. **Comparison Against Centralized Rules Engine:**
-   - The stateful centralized rules engine achieves only **71.4% precision and 71.4% recall** (F1 = 0.714, FPR = 0.400). It produces 10 false alarms across shared NATs and familiar user retries, while missing rotating IP botnets and multi-stage kill chains. Full TACG outperforms it by **+20.9% F1 score** with zero false alarms.
+   - The stateful centralized rules engine achieves **71.4% precision and 71.4% recall** (F1 = 0.714, FPR = 0.400). It produces 10 false alarms in these cases. Full TACG scores 1.000 F1 on the same authored set; that does not establish superiority on independent traffic.
+
+The separate `test_temporal_decay_ablation_filters_sporadic_drift` regression uses failures spaced 140 seconds apart. Full TACG does not join them; the uniform-edge variant does. This one designed example explains the mechanism but does not change the 60-case aggregate result or validate field precision.
 
 ---
 
