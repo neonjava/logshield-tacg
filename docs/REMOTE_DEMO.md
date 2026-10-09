@@ -38,7 +38,7 @@ The remote `.env` contains locally generated demo credentials and is readable on
 The laptop runs the same application pipeline and has been tested end to end. If the VPS or SSH tunnel is unavailable:
 
 ```bash
-cd /home/neonjava/logshield
+cd logshield
 docker compose up -d
 cd frontend
 npm run dev

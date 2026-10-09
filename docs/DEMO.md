@@ -9,7 +9,7 @@ This guide provides the exact demonstration flow for university hackathon presen
 Before the demo, launch the local environment:
 
 ```bash
-cd /home/neonjava/logshield
+cd logshield
 cargo run -p logshield-ingest --bin logshield-agent -- init-demo
 cargo build --release --workspace
 docker compose build
@@ -41,7 +41,7 @@ cd frontend && npm run dev
 You can execute the 2/2/1 attack directly via `curl` from the terminal:
 
 ```bash
-cd /home/neonjava/logshield
+cd logshield
 curl -sS -X POST http://127.0.0.1:3000/api/lab/clear
 
 # 2 failures on app-a, 2 on app-b, 1 on app-c
