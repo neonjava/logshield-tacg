@@ -1,32 +1,63 @@
-# Temporal Attack Correlation Graph
+# Temporal Attack Correlation Graph (TACG)
 
-## Problem and contribution
+For full mathematical equations, graph theory models, and weighting parameters, see [docs/ALGORITHM.md](ALGORITHM.md). For empirical evaluation and ablation study results, see [docs/EVALUATION.md](EVALUATION.md). For engineering boundaries and threat model limits, see [docs/LIMITATIONS.md](LIMITATIONS.md).
 
-A five-failure attack can be spread over three hosts as 2/2/1. A per-host threshold of five misses it. TACG correlates source identity, account, host and time to reconstruct a cross-host story. Event correlation exists elsewhere; this project's contribution is its transparent graph, cross-host threshold proof, attack-chain scoring, automated gateway action and observed verification.
+---
 
-## Nodes and edges
+## 1. Problem and Contribution
 
-Each normalized log record is a node. Events from the same source inside a 10-minute window are sorted by time. Adjacent nodes receive an edge when they share an entity and have temporal proximity. For distributed authentication, consecutive failures for the **same account** form an additional path only when their time-decayed strength is at least 0.35. Detection requires one path containing five failures across three hosts; a source-wide counter alone is insufficient. Edge reasons list shared source, destination, username, host, service or request ID, plus a risky transition. Temporal weight is `exp(-Δt / 90 seconds)`; close events have stronger links.
+A five-failure attack can be distributed across three server replicas as a 2/2/1 pattern. A per-host threshold of five misses it completely. Traditional centralized source counters flag benign corporate NATs and miss rotating-IP botnets.
 
-Gateway deny logs remain available as response evidence but do not count as app attack nodes. The graph is an in-memory Rust structure; SQL stores its edge evidence.
+TACG correlates source identity, targeted account, host, and time to reconstruct a cross-host attack story. This project's contribution is:
+- A transparent, in-memory attributed temporal graph in native Rust.
+- Dual-anchor clustering (source-anchored and identity-anchored) to detect both single-source and rotating-source distributed attacks.
+- Rigorous behavioral baseline and human typo/MFA retry discounting that prevents false containment.
+- Verified automated gateway containment with cryptographic proof of HTTP 403 enforcement.
 
-## Candidate patterns
+---
 
-- **Distributed authentication:** a connected same-account failure path contains at least five failures across three hosts. Each host can remain below five. Established source/account/host combinations still alert but receive a lower risk score, withholding automatic containment.
-- **Brute force:** at least six failures for one account on one host in the window.
-- **Multi-stage:** at least two failures for an account strictly precede its successful login, which strictly precedes its privilege action, which strictly precedes its outbound-style action.
-- **Unauthorized access:** an app unauthorized-access event.
+## 2. Nodes, Edges, and Clustering
 
-Normal successful logins alone are not candidates.
+### Graph Construction
+- **Nodes:** Normalized security log records.
+- **Edges:** Time-decayed links between events occurring within a 10-minute sliding window ($W_{\max} = 600$s).
+- **Temporal Weight:** $W_{\text{temporal}} = \exp(-\Delta t / 90\,\text{s})$; close events have stronger links.
+- **Entity Weight:** Overlap of shared source IP, destination IP, account/username, hostname, service, and request ID.
 
-## Explainable risk
+### Dual-Anchor Clustering
+1. **Pass 1: Source-Anchored Clustering:** Groups events sharing the same `source_ip` within the 10-minute sliding window. Detects localized brute-force, single-source distributed credential probing across hosts, and single-source multi-stage kill chains.
+2. **Pass 2: Identity-Anchored Clustering:** For events targeting the same account (`username`) originating from $\ge 2$ distinct sources. Connects rotating-source botnets and distributed password spraying that evade single-IP counters.
 
-`risk = min(100, 20R + 20T + 15E + 20X + 10C + 15B + chain_bonus)`
+---
 
-`R` is event rarity, `T` mean temporal strength, `E` mean shared-entity strength, `X` transition risk, `C` cross-host score and `B` behavioral deviation. The baseline learns usual user hours, hosts, source relationships and normal event volume from benign records. The explicit bonus is 8 for distributed auth, 12 for brute force and 25 for a multi-stage chain. Each weighted contribution and the bonus are stored in the incident JSON and shown in the UI.
+## 3. Candidate Patterns & Typo Discounting
 
-For a distributed pattern with `R=.8, T=.98, E=.95, X=.75, C=1, B=.65`, the score is `16 + 19.6 + 14.25 + 15 + 10 + 9.75 + 8 = 92.6`, rounded to 93. Real timings and entity links make the precise score vary. A response requires both risk >=85 and **evidence strength** >=85. The stored `confidence` field is a rule-based evidence score for API compatibility; **88/100 does not mean an 88% probability of attack**.
+- **Distributed Authentication:** A connected same-account failure path contains at least 5 failures across $\ge 3$ hosts.
+- **Rotating Sources:** At least 4 failures targeting a single account across $\ge 2$ distinct source IPs.
+- **Brute Force:** At least 6 failures for one account on one host in the window.
+- **Multi-Stage Kill-Chain:** Failure $\to$ Success $\to$ Privilege Action $\to$ Outbound Action in strict chronological order.
+- **MFA Push Fatigue:** $\ge 3$ consecutive MFA failures.
+- **Human Typo Tolerance:** 1–2 failed logins immediately followed by success by a familiar user on a known host is recognized as routine typing error and discounted, producing zero false alarms.
+- **Routine MFA Retries:** Up to 3 MFA retries spaced over normal human cadence by a familiar user is recognized as token expiration and suppressed from critical containment.
 
-## Limits
+---
 
-Source-IP grouping can be fooled by NAT or rotating source identities. The graph uses adjacent event links and same-account failure paths rather than exhaustive path search. The small baseline and hand-tuned thresholds need calibration on representative labeled data before operational deployment. Graph explanations are evidence, not a probabilistic guarantee of malicious intent. See [EVALUATION.md](EVALUATION.md) for the limited fixture comparison.
+## 4. Explainable Risk Formulation
+
+$$\text{Risk} = \min\left(100, \, \lfloor 20 \cdot R + 20 \cdot \bar{T} + 15 \cdot \bar{E} + 20 \cdot X + 10 \cdot C + 15 \cdot B + \text{Bonus} \rfloor\right)$$
+
+- $R$: Event rarity relative to baseline traffic.
+- $\bar{T}$: Mean time-decayed proximity of graph edges.
+- $\bar{E}$: Mean entity overlap ratio.
+- $X$: Transition risk between sequential event types.
+- $C$: Cross-host dispersion score (1.0 if $\ge 3$ distinct hosts).
+- $B$: Baseline statistical deviation from learned user profiles.
+- $\text{Bonus}$: Pattern bonuses (+25 multi-stage, +20 compromise, +18 MFA fatigue, +16 rotating sources, +8 distributed auth).
+
+Automatic containment requires both $\text{Risk} \ge 85$ and $\text{Evidence Strength} \ge 85$ with an approved response adapter.
+
+---
+
+## 5. Engineering Limits
+
+For full details, see [docs/LIMITATIONS.md](LIMITATIONS.md). Attacks throttled to $> 600$ seconds between attempts fall outside the real-time sliding graph window. First-time logins from novel locations without prior history are flagged as Medium-tier anomalies (alerts SOC) rather than Critical auto-containment to protect traveling employees.

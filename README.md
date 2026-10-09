@@ -18,7 +18,7 @@ LogShield normalizes incoming records into typed security events, builds a **Tem
 
 The risk calculation weights event rarity (20), temporal strength (20), entity relationship (15), transition risk (20), cross-host activity (10), and behavior deviation (15), then applies an explained chain bonus. Risk levels are low (0–39), medium (40–69), high (70–84), and critical (85–100). Automatic action also requires sufficient **rule-based evidence strength** and an **approved local response adapter**. The API retains the field name `confidence` for compatibility; it is a score out of 100, **not** a probability that the activity is malicious.
 
-Distributed detection requires a connected, time-decayed path of same-account failures across hosts; a centralized source counter alone cannot trigger that rule. Multi-stage detection enforces failure → success → privilege action → outbound activity in chronological order. A familiar account/source/host history lowers the distributed pattern below automatic containment while retaining an alert. The [small labeled comparison](docs/EVALUATION.md) gives reproducible fixture results and their limits. A [16-case mixed-traffic comparison](docs/EVALUATION.md#mixed-traffic-comparison-against-stateful-centralized-rules) measures precision, recall, and false-positive rate against stateful centralized rules on authored cases with background noise. A separate [local ingestion probe](docs/PERFORMANCE.md) reports measured latency for a synthetic benign workload.
+TACG employs **dual-anchor clustering**: Pass 1 correlates source-anchored patterns (multi-replica 2/2/1 brute force, multi-stage kill chains), while Pass 2 correlates identity-anchored patterns across multiple sources (rotating-IP botnets and distributed password spraying). A rolling behavioral baseline recognizes established users ($\ge 3$ historical logins) and discounts routine password typos (1–2 retries before success) and MFA code expirations, eliminating false critical containment on benign activity. For the formal mathematical specification, see [Algorithm Specification](docs/ALGORITHM.md). For empirical benchmarks, see [Empirical Evaluation](docs/EVALUATION.md), which includes a [16-case mixed-traffic comparison](docs/EVALUATION.md#2-16-case-mixed-traffic-evaluation-against-stateful-centralized-rules) (Precision 1.00, Recall 0.78, FPR 0.00, 0 benign criticals) and a [60-scenario ablation study](docs/EVALUATION.md#3-60-scenario-independent-benchmark-suite--ablation-study) (Full TACG F1 0.923 vs. Ablated 0.727 vs. Rules 0.833). A separate [local ingestion probe](docs/PERFORMANCE.md) reports measured latency for a synthetic benign workload.
 
 ## Two local demonstration environments
 
@@ -93,24 +93,33 @@ npm run dev
 Open `http://127.0.0.1:5173`. The local API is `http://127.0.0.1:3000`. `docker compose down` retains data volumes. `docker compose down -v` erases **this project's** lab and database volumes.
 
 ## Current API and demonstrations
-
+ 
 The REST API includes `/api/status`, `/api/stats`, `/api/events`, `/api/incidents`, `/api/entities`, `/api/responses`, `/api/logs/upload`, and the fixed `/api/lab/*` scenario controls. `/ws/events` streams live updates. Authenticated agent ingestion and fixed `/api/infra/*` controls are exercised by the Docker integration test.
 
-For the original two-minute demonstration, see [docs/DEMO.md](docs/DEMO.md). For design and judge explanations, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/TACG.md](docs/TACG.md), [docs/REAL_WORLD_PROBLEM.md](docs/REAL_WORLD_PROBLEM.md), and [docs/PITCH.md](docs/PITCH.md).
+For the live hackathon pitch and step-by-step presentation, see [Hackathon Demonstration Guide](docs/DEMO.md). For detailed specifications, see [Algorithm Specification](docs/ALGORITHM.md), [Empirical Evaluation](docs/EVALUATION.md), [Architecture](docs/ARCHITECTURE.md), and [Engineering Boundaries](docs/LIMITATIONS.md).
 
 ## Testing
 
 ```bash
+# Code Quality & Workspace Tests
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo build --workspace
+
+# Reproducible Benchmarks
+cargo test -p logshield-core --test mixed_evaluation -- --nocapture
+cargo test -p logshield-core --test benchmark_suite -- --nocapture
+
+# Multi-Server Docker Lab E2E Integration (requires Docker Compose)
+cargo build --release --workspace
 cargo test -p logshield-api --test lab_e2e -- --ignored
+
+# Frontend Production Build
 cd frontend && npm run build
 ```
 
-The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions now runs formatting, Clippy, workspace tests (including non-lab API and WebSocket authentication), frontend build, and Docker end-to-end on each push and pull request. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
+The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions runs formatting, Clippy, workspace tests, frontend build, and Docker end-to-end on each push and pull request.
 
 ## Known limitations and next steps
 
-The lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. It is designed for safe integration testing. Outside lab mode, operator authentication is required, but trustworthy source attribution, TLS termination, network access policy, secret rotation, and audit procedures remain deployment responsibilities. The API still loads a bounded recent event set and recomputes correlations after batches. A synthetic benign workload has been measured, but sustained mixed-traffic latency is unmeasured. The SDK offers an optional bounded disk spool; callers must schedule flushing, and the file agent does not yet fully handle rotation. Future work includes tenant isolation, secret management, agent enrollment, representative labeled-data evaluation, calibrated baselines, incremental correlation, and human-reviewed response policy.
+The lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. For a detailed discussion of operational boundaries, threat model limits (e.g., attacks exceeding the 600-second correlation window), and zero-history travel anomalies, see [docs/LIMITATIONS.md](docs/LIMITATIONS.md). Future work includes tenant isolation, enterprise secret management, agent enrollment, horizontal stream sharding, and human-in-the-loop response review.
