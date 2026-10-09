@@ -62,12 +62,12 @@ services:
     environment: {LAB_ROLE: attacker, GATEWAY_URL: "http://logshield-gateway:8080"}
     networks: [control, edge]
   session-store:
-    image: redis:7-alpine
+    image: mirror.gcr.io/library/redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "no", "--save", ""]
     networks: [backend]
   app-database:
-    image: postgres:17-alpine
+    image: mirror.gcr.io/library/postgres:17-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: logshield_demo
