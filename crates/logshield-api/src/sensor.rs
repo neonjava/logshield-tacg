@@ -22,6 +22,7 @@ pub async fn start(
     offsets: Offsets,
 ) {
     loop {
+        online.store(dir.is_dir(), Ordering::Relaxed);
         for name in FILES {
             let path = dir.join(name);
             match read_new(&path, &offsets).await {
@@ -44,7 +45,6 @@ pub async fn start(
                 Err(e) => tracing::warn!(file=%name,%e,"sensor read failed"),
             }
         }
-        online.store(true, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 }

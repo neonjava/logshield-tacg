@@ -85,19 +85,7 @@ async fn main() {
         log_dir: log_dir.clone(),
         sensor_online: Arc::new(AtomicBool::new(false)),
         offsets: Arc::new(Mutex::new(HashMap::new())),
-        ingest_tokens: ["infra-a", "infra-b", "infra-c"]
-            .iter()
-            .zip([
-                "LOGSHIELD_INGEST_A",
-                "LOGSHIELD_INGEST_B",
-                "LOGSHIELD_INGEST_C",
-            ])
-            .filter_map(|(source, key)| {
-                std::env::var(key)
-                    .ok()
-                    .map(|token| (source.to_string(), token))
-            })
-            .collect(),
+        ingest_tokens: load_ingest_tokens(),
     };
     tokio::spawn(worker(state.clone(), rx));
     tokio::spawn(sensor::start(
@@ -146,6 +134,44 @@ async fn main() {
         .expect("API_BIND");
     tracing::info!(%bind,"LogShield API ready");
     axum::serve(listener, app).await.unwrap();
+}
+fn load_ingest_tokens() -> HashMap<String, String> {
+    let mut tokens: HashMap<String, String> = [
+        ("infra-a", "LOGSHIELD_INGEST_A"),
+        ("infra-b", "LOGSHIELD_INGEST_B"),
+        ("infra-c", "LOGSHIELD_INGEST_C"),
+    ]
+    .into_iter()
+    .filter_map(|(source, key)| std::env::var(key).ok().map(|token| (source.into(), token)))
+    .collect();
+    if let Ok(value) = std::env::var("LOGSHIELD_INGEST_TOKENS")
+        && !value.trim().is_empty()
+    {
+        let extra: HashMap<String, String> =
+            serde_json::from_str(&value).expect("LOGSHIELD_INGEST_TOKENS must be a JSON object");
+        for (source, token) in extra {
+            assert!(
+                !source.is_empty()
+                    && source.len() <= 64
+                    && source
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "invalid ingestion source name"
+            );
+            tokens.insert(source, token);
+        }
+    }
+    assert!(
+        tokens.values().all(|token| token.len() >= 24),
+        "ingestion tokens must contain at least 24 characters"
+    );
+    let unique: std::collections::HashSet<_> = tokens.values().collect();
+    assert_eq!(
+        unique.len(),
+        tokens.len(),
+        "ingestion tokens must be unique"
+    );
+    tokens
 }
 async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
     while let Some(batch) = rx.recv().await {

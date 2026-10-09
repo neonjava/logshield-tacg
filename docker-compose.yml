@@ -17,6 +17,7 @@ services:
       LOGSHIELD_INGEST_A: ${LOGSHIELD_INGEST_A:?run logshield-agent init-demo}
       LOGSHIELD_INGEST_B: ${LOGSHIELD_INGEST_B:?run logshield-agent init-demo}
       LOGSHIELD_INGEST_C: ${LOGSHIELD_INGEST_C:?run logshield-agent init-demo}
+      LOGSHIELD_INGEST_TOKENS: ${LOGSHIELD_INGEST_TOKENS:-}
     volumes:
       - lab-logs:/logs:ro
       - api-state:/state

@@ -73,10 +73,50 @@ async fn read_batch(path: &PathBuf, offset: u64) -> std::io::Result<(u64, Vec<St
     let mut buf = vec![0; (len - start).min(131_072) as usize];
     let n = file.read(&mut buf).await?;
     buf.truncate(n);
-    let Some(last_newline) = buf.iter().rposition(|b| *b == b'\n') else {
-        return Ok((0, vec![]));
+    let Some(last_newline) = buf
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .take(100)
+        .last()
+        .map(|(index, _)| index)
+    else {
+        return Ok((start, vec![]));
     };
     let consumed = (last_newline + 1) as u64;
     let text = String::from_utf8_lossy(&buf[..=last_newline]);
     Ok((start + consumed, text.lines().map(str::to_owned).collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn keeps_partial_line_until_completed() {
+        let path = std::env::temp_dir().join(format!("logshield-agent-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"first\nsecond").await.unwrap();
+        let (offset, lines) = read_batch(&path, 0).await.unwrap();
+        assert_eq!(offset, 6);
+        assert_eq!(lines, ["first"]);
+        let (again, lines) = read_batch(&path, offset).await.unwrap();
+        assert_eq!(again, offset);
+        assert!(lines.is_empty());
+        tokio::fs::write(&path, b"first\nsecond\n").await.unwrap();
+        let (offset, lines) = read_batch(&path, offset).await.unwrap();
+        assert_eq!(offset, 13);
+        assert_eq!(lines, ["second"]);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn limits_batches_to_api_capacity() {
+        let path = std::env::temp_dir().join(format!("logshield-agent-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, "line\n".repeat(101)).await.unwrap();
+        let (offset, first) = read_batch(&path, 0).await.unwrap();
+        assert_eq!(first.len(), 100);
+        let (_, second) = read_batch(&path, offset).await.unwrap();
+        assert_eq!(second.len(), 1);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
 }

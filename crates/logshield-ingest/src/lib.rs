@@ -1,4 +1,15 @@
-use logshield_core::event::SecurityEvent;
+pub use logshield_core::event::{EventType, SecurityEvent};
+
+/// Create a timestamped event. Set the remaining optional fields before sending.
+pub fn new_event(event_type: EventType, source: &str, host: &str) -> SecurityEvent {
+    SecurityEvent::new(event_type, chrono::Utc::now(), source, host)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct IngestReceipt {
+    pub queued: usize,
+    pub source: String,
+}
 
 /// Reusable, authenticated Rust client for applications and file agents.
 pub struct IngestClient {
@@ -14,10 +25,8 @@ impl IngestClient {
             token: token.into(),
         }
     }
-    pub async fn send(
-        &self,
-        events: &[SecurityEvent],
-    ) -> Result<serde_json::Value, reqwest::Error> {
+    /// Submit 1–100 events. A receipt means queued by the API, not durably stored yet.
+    pub async fn send(&self, events: &[SecurityEvent]) -> Result<IngestReceipt, reqwest::Error> {
         self.http
             .post(format!(
                 "{}/api/ingest/events",
