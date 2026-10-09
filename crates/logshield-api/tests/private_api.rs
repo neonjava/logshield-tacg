@@ -6,11 +6,13 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::{oneshot, watch},
 };
 use uuid::Uuid;
 
@@ -317,6 +319,105 @@ async fn durable_sdk_queue_replays_after_offline_period() {
     assert_eq!(events.as_array().unwrap().len(), 1);
     assert_eq!(events[0]["id"], event.id.to_string());
     drop(server);
+}
+
+#[tokio::test]
+async fn retry_worker_delivers_after_api_returns() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let directory = std::env::temp_dir().join(format!("logshield-worker-{}", Uuid::new_v4()));
+    let _cleanup = TestDir(directory.clone());
+    let operator = Uuid::new_v4().simple().to_string();
+    let source = Uuid::new_v4().simple().to_string();
+    let base = format!("http://127.0.0.1:{port}");
+    let event = new_event(EventType::WebRequest, "client", "claimed-host");
+    let queue = Arc::new(
+        DurableIngestQueue::new(
+            IngestClient::new(&base, &source),
+            directory.join("spool"),
+            2,
+        )
+        .unwrap(),
+    );
+    queue.enqueue(std::slice::from_ref(&event)).await.unwrap();
+    let (stop, receiver) = watch::channel(false);
+    let worker_queue = queue.clone();
+    let worker = tokio::spawn(async move {
+        worker_queue
+            .run_until_cancelled(Duration::from_millis(100), receiver)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(queue.pending_batches().await.unwrap(), 1);
+    let server = Server::start(port, directory, &operator, &source);
+    ready(&Client::new(), &base).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while queue.pending_batches().await.unwrap() != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    let stored: Value = Client::new()
+        .get(format!("{base}/api/events"))
+        .bearer_auth(&operator)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored.as_array().unwrap().len(), 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn producers_can_enqueue_while_delivery_is_slow() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let mock = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let _ = socket.read(&mut buffer).await.unwrap();
+        accepted_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        socket
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let directory = std::env::temp_dir().join(format!("logshield-slow-{}", Uuid::new_v4()));
+    let _cleanup = TestDir(directory.clone());
+    let queue = Arc::new(
+        DurableIngestQueue::new(
+            IngestClient::new(format!("http://127.0.0.1:{port}"), "test-token"),
+            directory.join("spool"),
+            2,
+        )
+        .unwrap(),
+    );
+    let first = new_event(EventType::WebRequest, "client", "host");
+    queue.enqueue(&[first]).await.unwrap();
+    let flushing = {
+        let queue = queue.clone();
+        tokio::spawn(async move { queue.flush().await })
+    };
+    accepted_rx.await.unwrap();
+    let second = new_event(EventType::WebRequest, "client", "host");
+    tokio::time::timeout(Duration::from_millis(500), queue.enqueue(&[second]))
+        .await
+        .expect("enqueue must not wait for HTTP")
+        .unwrap();
+    assert!(matches!(
+        flushing.await.unwrap(),
+        Err(QueueError::Delivery(_))
+    ));
+    assert_eq!(queue.pending_batches().await.unwrap(), 2);
+    mock.await.unwrap();
 }
 
 #[tokio::test]

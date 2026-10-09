@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -30,7 +30,8 @@ pub struct DurableIngestQueue {
     client: IngestClient,
     directory: PathBuf,
     max_pending_batches: usize,
-    guard: Mutex<()>,
+    io_guard: Mutex<()>,
+    flush_guard: Mutex<()>,
 }
 impl DurableIngestQueue {
     pub fn new(
@@ -52,7 +53,8 @@ impl DurableIngestQueue {
             client,
             directory,
             max_pending_batches,
-            guard: Mutex::new(()),
+            io_guard: Mutex::new(()),
+            flush_guard: Mutex::new(()),
         })
     }
 
@@ -65,7 +67,7 @@ impl DurableIngestQueue {
         if payload.len() > 1_000_000 {
             return Err(QueueError::InvalidBatch);
         }
-        let _guard = self.guard.lock().await;
+        let _guard = self.io_guard.lock().await;
         if pending_files(&self.directory)?.len() >= self.max_pending_batches {
             return Err(QueueError::Full);
         }
@@ -87,25 +89,64 @@ impl DurableIngestQueue {
     }
 
     pub async fn pending_batches(&self) -> Result<usize, QueueError> {
-        let _guard = self.guard.lock().await;
+        let _guard = self.io_guard.lock().await;
         Ok(pending_files(&self.directory)?.len())
     }
 
     /// Deliver oldest batches first. Any failed batch stays on disk for a later retry.
     pub async fn flush(&self) -> Result<usize, QueueError> {
-        let _guard = self.guard.lock().await;
+        let _flush = self.flush_guard.lock().await;
+        let files = {
+            let _io = self.io_guard.lock().await;
+            pending_files(&self.directory)?
+        };
         let mut delivered = 0;
-        for path in pending_files(&self.directory)? {
-            let events: Vec<SecurityEvent> = serde_json::from_slice(&fs::read(&path)?)?;
+        for path in files {
+            let events: Vec<SecurityEvent> = {
+                let _io = self.io_guard.lock().await;
+                serde_json::from_slice(&fs::read(&path)?)?
+            };
             let receipt = self.client.send(&events).await?;
             if !receipt.durable || receipt.queued != events.len() {
                 return Err(QueueError::MissingDurableReceipt);
             }
+            let _io = self.io_guard.lock().await;
             fs::remove_file(path)?;
             sync_directory(&self.directory)?;
             delivered += 1;
         }
         Ok(delivered)
+    }
+
+    /// Retry pending batches on startup and at each interval until shutdown.
+    /// Errors keep data on disk and are logged; the next interval retries them.
+    pub async fn run_until_cancelled(
+        &self,
+        interval: std::time::Duration,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let interval = interval.max(std::time::Duration::from_millis(100));
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            tokio::select! {
+                result = self.flush() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "queued LogShield delivery will be retried");
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {},
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+            }
+        }
     }
 }
 fn pending_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
