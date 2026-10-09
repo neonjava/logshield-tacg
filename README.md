@@ -109,7 +109,7 @@ cargo test -p logshield-api --test lab_e2e -- --ignored
 cd frontend && npm run build
 ```
 
-The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions runs formatting, Clippy, unit tests, and the frontend build on push; the Docker integration job can be launched manually. [Run #38023397626](https://github.com/neonjava/logshield-tacg/actions/runs/38023397626) passed all three jobs, including Docker end-to-end. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
+The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions now runs formatting, Clippy, workspace tests (including non-lab API and WebSocket authentication), frontend build, and Docker end-to-end on each push and pull request. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
 
 ## Known limitations and next steps
 
