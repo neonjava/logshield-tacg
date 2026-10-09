@@ -1,12 +1,12 @@
 # LogShield TACG
 
-**Remote showcase and local fallback:** see [docs/REMOTE_DEMO.md](docs/REMOTE_DEMO.md). The VPS demonstration uses three Rust replicas, authenticated log agents, real gateway requests, and a dashboard reachable through an SSH tunnel; the same demo works locally if the VPS is unavailable.
+**Remote showcase and local fallback:** see [docs/REMOTE_DEMO.md](docs/REMOTE_DEMO.md). The VPS demonstration uses three Rust replicas, authenticated log agents, real gateway requests, and a dashboard reachable through an SSH tunnel; the same demo works locally if the VPS is unavailable. Developers can integrate the [Rust ingestion SDK](docs/SDK.md) from Git. The source is licensed under [Apache-2.0](LICENSE).
 
 **AI26CY03 — Log-Based Intrusion Detection**
 
 LogShield TACG is a defensive security-monitoring project. It collects system, application, authentication, and gateway logs; connects related events across time and servers; shows the evidence behind an incident; and verifies a local defensive response. Its detection engine and backend are written in Rust. The React dashboard displays results and offers controlled demonstration tools.
 
-> **Status:** The original isolated Docker lab is verified end to end. A second, more realistic multi-server application infrastructure is being integrated. Its Redis/PostgreSQL services, agents, MFA flows, and download/export UI should be treated as **in progress until the Docker integration checks pass**. This README distinguishes verified behavior from that extension.
+> **Status:** Both the isolated lab and the multi-server application extension pass Rust, frontend, and Docker end-to-end CI checks. They remain demonstration infrastructure, not a production security service. The public SDK is a Git dependency; no crate has been published to crates.io.
 
 ## The problem
 
@@ -38,7 +38,7 @@ controlled client → Rust gateway → app-a / app-b / app-c
 
 The Lab page also provides normal traffic, a multi-stage sequence, forced response failure, and links to three sample browser pages. These are **client views for fixed Docker targets**, not internet-facing applications.
 
-### Multi-server application extension — in progress
+### Multi-server application extension
 
 The new local infrastructure is designed to show how a company could attach LogShield to a real application stack. Three Rust servers run a shared portal behind round-robin gateway routing. A user completes a password **and MFA** login once, then uses one Redis-backed session across the servers. Each server also exposes a distinct protected activity: operations, reports, or inventory. PostgreSQL holds the dummy user and activity records; Redis holds expiring challenges and sessions. Each server writes its own log, and a read-only Rust agent submits those logs through an authenticated ingestion API. A Rust SDK supports applications that prefer direct event submission. LogShield's SQLite remains separate from application data.
 
@@ -55,11 +55,11 @@ browser/terminal → fixed local API → Rust gateway → round-robin portal rep
                                TACG → SQLite incidents → SOC dashboard
 ```
 
-This extension will demonstrate three primary detections: **brute-force password attempts**, a **suspicious completed login** after failures or from a historically new source, and **repeated failed MFA checks**. A change of replica alone is normal load-balancer behavior and must not be flagged. A password alone is not a completed login when MFA is required.
+This extension demonstrates three primary detections: **brute-force password attempts**, a **suspicious completed login** after failures or from a historically new source, and **repeated failed MFA checks**. A change of replica alone is normal load-balancer behavior and must not be flagged. A password alone is not a completed login when MFA is required.
 
 ## Log sources and provenance
 
-Automatic collection is the main path. The lab uses a read-only file sensor; the shared-portal infrastructure uses per-server agents and a typed Rust ingestion SDK. The Events page accepts limited UTF-8 `.log`, `.txt`, and `.jsonl` uploads, offers safe downloadable samples, and exports stored records. Manual uploads can create explained incidents but **never authorize automatic containment**. Live agent credentials are generated locally and must not be committed.
+Automatic collection is the main path. The lab uses a read-only file sensor; the shared-portal infrastructure uses per-server agents and a typed Rust ingestion SDK. [SDK setup and a compilable example](docs/SDK.md) explain how another Rust application can send events. The Events page accepts limited UTF-8 `.log`, `.txt`, and `.jsonl` uploads, offers safe downloadable samples, and exports stored records. Manual uploads can create explained incidents but **never authorize automatic containment**. Live agent credentials are generated locally and must not be committed.
 
 The ingestion path validates input size and format, never executes log contents, and stores evidence with source provenance. No uploaded record should be trusted to claim the identity of an authenticated agent.
 
@@ -109,7 +109,7 @@ cargo test -p logshield-api --test lab_e2e -- --ignored
 cd frontend && npm run build
 ```
 
-The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions runs formatting, Clippy, unit tests, and the frontend build on push; the Docker integration job can be launched manually. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
+The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions runs formatting, Clippy, unit tests, and the frontend build on push; the Docker integration job can be launched manually. [Run #38023397626](https://github.com/neonjava/logshield-tacg/actions/runs/38023397626) passed all three jobs, including Docker end-to-end. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
 
 ## Known limitations and next steps
 
