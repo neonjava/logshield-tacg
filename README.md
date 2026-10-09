@@ -62,7 +62,7 @@ Open **http://127.0.0.1:5173**. The API is published only on `127.0.0.1:3000`; g
 - **Multi-stage:** two failed logins, successful dummy login, intentional lab admin operation and local outbound-style operation. These are safe endpoints, not vulnerabilities.
 - **Force response failure:** gateway refuses the block (HTTP 503); the client retries and receives HTTP 401 from the app, proving the request got through. Incident remains `RESPONSE_FAILED` and calls for human intervention.
 
-The demo client never inserts an event directly into TACG. Its only scenario inputs are fixed requests through the gateway. See the exact [two-minute script](docs/DEMO.md).
+The demo client never inserts an event directly into TACG. Its requests pass through the gateway, app log, and Rust sensor. For a hands-on showcase, open the **Lab** page and its three sample app links (`/lab/app-a`, `/lab/app-b`, `/lab/app-c`). The pages display actual gateway results for manual logins and safe lab operations. The fixed-target terminal commands and exact two-minute script are in [docs/DEMO.md](docs/DEMO.md).
 
 ## API
 
@@ -77,6 +77,7 @@ The demo client never inserts an event directly into TACG. Its only scenario inp
 | GET | `/api/incidents`, `/api/incidents/{id}` | Incident queue and evidence |
 | GET | `/api/incidents/{id}/response`, `/api/responses` | Response and HTTP verification |
 | POST | `/api/lab/run/{normal,distributed,multistage}` | Ask the fixed lab client to send real requests |
+| POST | `/api/lab/attempt` | One fixed-target request to app-a, app-b, or app-c through the lab gateway |
 | POST | `/api/lab/force-failure` | Lab-only `{ "enabled": true }` |
 | POST | `/api/lab/clear` | Reset lab records and gateway block |
 | WS | `/ws/events` | Live event and incident notifications |
