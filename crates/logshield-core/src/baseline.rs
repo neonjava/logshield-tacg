@@ -13,6 +13,7 @@ pub struct UserProfile {
     pub hours: HashSet<u32>,
     pub hosts: HashSet<String>,
     pub source_ips: HashSet<String>,
+    pub successful_logins: usize,
 }
 impl Baseline {
     pub fn learn(events: &[SecurityEvent]) -> Self {
@@ -24,6 +25,8 @@ impl Baseline {
             if matches!(
                 e.event_type,
                 EventType::FailedLogin
+                    | EventType::PasswordAccepted
+                    | EventType::MfaFailure
                     | EventType::UnauthorizedAccess
                     | EventType::PrivilegeAction
                     | EventType::UnusualNetworkActivity
@@ -35,6 +38,9 @@ impl Baseline {
             }
             if let Some(u) = &e.username {
                 let p = b.users.entry(u.clone()).or_default();
+                if e.event_type == EventType::SuccessfulLogin {
+                    p.successful_logins += 1;
+                }
                 p.hours.insert(e.timestamp.hour());
                 if let Some(h) = &e.hostname {
                     p.hosts.insert(h.clone());

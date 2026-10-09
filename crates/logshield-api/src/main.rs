@@ -6,7 +6,8 @@ use axum::{
         DefaultBodyLimit, Multipart, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post},
 };
 use chrono::Utc;
@@ -50,6 +51,7 @@ struct AppState {
     log_dir: PathBuf,
     sensor_online: Arc<AtomicBool>,
     offsets: sensor::Offsets,
+    ingest_tokens: HashMap<String, String>,
 }
 
 #[tokio::main]
@@ -77,6 +79,19 @@ async fn main() {
         log_dir: log_dir.clone(),
         sensor_online: Arc::new(AtomicBool::new(false)),
         offsets: Arc::new(Mutex::new(HashMap::new())),
+        ingest_tokens: ["infra-a", "infra-b", "infra-c"]
+            .iter()
+            .zip([
+                "LOGSHIELD_INGEST_A",
+                "LOGSHIELD_INGEST_B",
+                "LOGSHIELD_INGEST_C",
+            ])
+            .filter_map(|(source, key)| {
+                std::env::var(key)
+                    .ok()
+                    .map(|token| (source.to_string(), token))
+            })
+            .collect(),
     };
     tokio::spawn(worker(state.clone(), rx));
     tokio::spawn(sensor::start(
@@ -90,6 +105,14 @@ async fn main() {
         .route("/api/status", get(status))
         .route("/api/events", get(events).post(add_event))
         .route("/api/logs/upload", post(upload))
+        .route("/api/logs/sample/{name}", get(sample_logs))
+        .route("/api/logs/export", get(export_logs))
+        .route("/api/ingest/events", post(ingest_events))
+        .route("/api/ingest/heartbeat", post(ingest_heartbeat))
+        .route("/api/infra/status", get(infra_status))
+        .route("/api/infra/activities", get(infra_activities))
+        .route("/api/infra/request", post(infra_request))
+        .route("/api/infra/run/{name}", post(infra_run))
         .route("/api/entities", get(entities))
         .route("/api/incidents", get(incidents))
         .route("/api/incidents/{id}", get(incident))
@@ -151,7 +174,14 @@ async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
                 }
                 new.id = old.id;
             }
-            if response::eligible(&new) && state.lab_mode {
+            if response::eligible(&new)
+                && state.lab_mode
+                && new.events.iter().all(|e| {
+                    e.origin.as_deref().is_some_and(|origin| {
+                        origin == "lab_sensor" || origin.starts_with("agent:")
+                    })
+                })
+            {
                 response::begin(&mut new);
             }
             if let Err(err) = db::save_incident(&state.db, &new).await {
@@ -208,22 +238,95 @@ async fn execute_response(state: AppState, id: String) {
     if applied {
         let _=sqlx::query("INSERT OR REPLACE INTO gateway_blocks(incident_id,source,expires_at,payload) VALUES(?,?,?,?)").bind(&id).bind(&source).bind(block_body.pointer("/block/expires_at").and_then(Value::as_str).unwrap_or("")).bind(block_body.to_string()).execute(&state.db).await;
     }
+    let mut session_verified = true;
+    if incident.kind == "SUSPICIOUS SUCCESSFUL LOGIN" || incident.kind == "UNUSUAL SUCCESSFUL LOGIN"
+    {
+        session_verified = false;
+        let challenge = incident
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == logshield_core::event::EventType::SuccessfulLogin)
+            .and_then(|e| e.challenge_id.clone());
+        if let Some(challenge_id) = challenge {
+            let revoked = state
+                .client
+                .post(format!("{}/internal/infra/revoke", state.gateway))
+                .json(&serde_json::json!({"challenge_id":challenge_id}))
+                .send()
+                .await
+                .ok();
+            if let Some(r) = revoked.and_then(|r| r.error_for_status().ok())
+                && let Ok(body) = r.json::<Value>().await
+                && body["revoked"] == true
+                && let Some(token) = body["token"].as_str()
+            {
+                response::record(
+                    &mut incident,
+                    "SESSION_REVOKED",
+                    "shared Redis session deleted".into(),
+                    Some(200),
+                );
+                if let Ok(r) = state
+                    .client
+                    .post(format!("{}/internal/infra/session-active", state.gateway))
+                    .json(&serde_json::json!({"token":token}))
+                    .send()
+                    .await
+                    && let Ok(check) = r.json::<Value>().await
+                {
+                    session_verified = check["active"] == false;
+                }
+            }
+        }
+        response::record(
+            &mut incident,
+            if session_verified {
+                "SESSION_REVOCATION_VERIFIED"
+            } else {
+                "SESSION_REVOCATION_FAILED"
+            },
+            if session_verified {
+                "revoked session is no longer active".into()
+            } else {
+                "could not verify session revocation; human intervention required".into()
+            },
+            None,
+        );
+    }
     response::record(
         &mut incident,
         "VERIFICATION_REQUEST_SENT",
         "attacker-lab retries a fixed login through the gateway".into(),
         None,
     );
-    let verify_result = state
-        .client
-        .post(format!("{}/verify", state.attacker))
-        .send()
-        .await;
-    let observation = match verify_result {
-        Ok(r) => r
-            .json::<Value>()
+    let verify_result = if incident.target.starts_with("infra-") {
+        state
+            .client
+            .post(format!("{}/infra/password", state.gateway))
+            .header("x-lab-source", "attacker-lab")
+            .json(&serde_json::json!({"username":"demo","password":"incorrect"}))
+            .send()
             .await
-            .unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"status":0})),
+    } else {
+        state
+            .client
+            .post(format!("{}/verify", state.attacker))
+            .send()
+            .await
+    };
+    let observation = match verify_result {
+        Ok(r) => {
+            if incident.target.starts_with("infra-") {
+                let status = r.status().as_u16();
+                let body = r.json::<Value>().await.unwrap_or_default();
+                serde_json::json!({"status":status,"body":body})
+            } else {
+                r.json::<Value>()
+                    .await
+                    .unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"status":0}))
+            }
+        }
         Err(e) => serde_json::json!({"error":e.to_string(),"status":0}),
     };
     let http_status = observation
@@ -245,7 +348,15 @@ async fn execute_response(state: AppState, id: String) {
         observation.to_string(),
         Some(http_status),
     );
-    response::finish(&mut incident, blocked && applied, http_status, matched);
+    response::finish(
+        &mut incident,
+        blocked && applied && session_verified,
+        http_status,
+        matched,
+    );
+    if !session_verified && let Some(record) = incident.response.as_mut() {
+        record.result = "Gateway result recorded, but shared session revocation was not verified; human intervention required".into();
+    }
     let _=sqlx::query("INSERT INTO verification_attempts(id,incident_id,timestamp,http_status,blocked,matched,payload) VALUES(?,?,?,?,?,?,?)").bind(uuid::Uuid::new_v4().to_string()).bind(&id).bind(Utc::now().to_rfc3339()).bind(http_status as i64).bind(blocked).bind(matched).bind(observation.to_string()).execute(&state.db).await;
     if let Err(e) = db::save_incident(&state.db, &incident).await {
         tracing::error!(%e,"response save failed");
@@ -298,16 +409,328 @@ async fn status(State(s): State<AppState>) -> ApiResult<Value> {
         serde_json::json!({"gateway":gateway,"attacker":attacker,"sensor":s.sensor_online.load(Ordering::Relaxed),"tacg":true,"database":database,"services_online":service_body.get("online").and_then(Value::as_u64).unwrap_or(0),"services_total":3,"force_response_failure":service_body.get("force_response_failure").and_then(Value::as_bool).unwrap_or(false),"events_per_second":recent as f64/60.0,"last_event":last}),
     ))
 }
+async fn infra_status(State(s): State<AppState>) -> ApiResult<Value> {
+    let r = s
+        .client
+        .get(format!("{}/internal/infra-status", s.gateway))
+        .send()
+        .await
+        .map_err(internal)?;
+    let mut body = r.json::<Value>().await.map_err(internal)?;
+    let rows = sqlx::query("SELECT source,seen_at FROM source_heartbeats")
+        .fetch_all(&s.db)
+        .await
+        .map_err(internal)?;
+    let agents: Vec<Value> = ["infra-a", "infra-b", "infra-c"]
+        .iter()
+        .map(|name| {
+            let online = rows
+                .iter()
+                .find(|r| r.get::<String, _>("source") == *name)
+                .and_then(|r| {
+                    chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("seen_at")).ok()
+                })
+                .is_some_and(|t| {
+                    Utc::now()
+                        .signed_duration_since(t.with_timezone(&Utc))
+                        .num_seconds()
+                        < 15
+                });
+            serde_json::json!({"name":name,"online":online})
+        })
+        .collect();
+    body["agents"] = serde_json::json!(agents);
+    Ok(Json(body))
+}
+async fn infra_activities(State(s): State<AppState>) -> ApiResult<Value> {
+    let r = s
+        .client
+        .get(format!("{}/internal/infra-activities", s.gateway))
+        .send()
+        .await
+        .map_err(internal)?;
+    Ok(Json(r.json::<Value>().await.map_err(internal)?))
+}
+fn ingest_source(s: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+    let credential = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    s.ingest_tokens
+        .iter()
+        .find(|(_, token)| !credential.is_empty() && token.as_str() == credential)
+        .map(|(name, _)| name.clone())
+        .ok_or((StatusCode::UNAUTHORIZED, "invalid ingestion token".into()))
+}
+async fn ingest_heartbeat(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    let source = ingest_source(&s, &headers)?;
+    sqlx::query("INSERT INTO source_heartbeats(source,seen_at) VALUES(?,?) ON CONFLICT(source) DO UPDATE SET seen_at=excluded.seen_at")
+        .bind(&source).bind(Utc::now().to_rfc3339()).execute(&s.db).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"source":source,"ok":true})))
+}
+#[derive(Deserialize, Serialize, Clone)]
+struct InfraRequest {
+    action: String,
+    source: String,
+    password: Option<String>,
+    challenge_id: Option<String>,
+    code: Option<String>,
+    token: Option<String>,
+}
+async fn send_infra(s: &AppState, body: &InfraRequest) -> ApiResult<Value> {
+    if !s.lab_mode {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
+    }
+    if ![
+        "password",
+        "password-a",
+        "mfa",
+        "session",
+        "operations",
+        "reports",
+        "inventory",
+        "demo-code",
+    ]
+    .contains(&body.action.as_str())
+        || !["normal-client", "attacker-lab"].contains(&body.source.as_str())
+        || [&body.password, &body.challenge_id, &body.code, &body.token]
+            .iter()
+            .any(|v| v.as_ref().is_some_and(|s| s.len() > 128))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "fixed local infra operations only".into(),
+        ));
+    }
+    let payload = match body.action.as_str() {
+        "password" | "password-a" => {
+            serde_json::json!({"username":"demo","password":body.password.as_deref().unwrap_or("")})
+        }
+        "mfa" => serde_json::json!({"challenge_id":body.challenge_id,"code":body.code}),
+        "demo-code" => serde_json::json!({"challenge_id":body.challenge_id}),
+        _ => serde_json::json!({"token":body.token}),
+    };
+    let r = s
+        .client
+        .post(format!("{}/infra/{}", s.gateway, body.action))
+        .header("x-lab-source", &body.source)
+        .header("x-request-id", uuid::Uuid::new_v4().to_string())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(internal)?;
+    let status = r.status().as_u16();
+    let response = r.json::<Value>().await.unwrap_or_default();
+    Ok(Json(
+        serde_json::json!({"status":status,"body":response,"action":body.action}),
+    ))
+}
+async fn infra_request(
+    State(s): State<AppState>,
+    Json(body): Json<InfraRequest>,
+) -> ApiResult<Value> {
+    send_infra(&s, &body).await
+}
+async fn infra_run(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    if !["normal", "bruteforce", "distributed", "suspicious", "mfa"].contains(&name.as_str()) {
+        return Err((StatusCode::NOT_FOUND, "fixed scenarios only".into()));
+    }
+    let make = |action: &str,
+                source: &str,
+                password: Option<&str>,
+                challenge_id: Option<String>,
+                code: Option<String>,
+                token: Option<String>| InfraRequest {
+        action: action.into(),
+        source: source.into(),
+        password: password.map(str::to_owned),
+        challenge_id,
+        code,
+        token,
+    };
+    let mut requests = Vec::new();
+    if name == "normal" || name == "suspicious" || name == "mfa" {
+        if name == "suspicious" {
+            for _ in 0..2 {
+                requests.push(
+                    send_infra(
+                        &s,
+                        &make("password", "attacker-lab", Some("wrong"), None, None, None),
+                    )
+                    .await?
+                    .0,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            }
+        }
+        let source = if name == "normal" {
+            "normal-client"
+        } else {
+            "attacker-lab"
+        };
+        let accepted = send_infra(
+            &s,
+            &make("password", source, Some("hackathon123"), None, None, None),
+        )
+        .await?
+        .0;
+        let challenge = accepted
+            .pointer("/body/challenge_id")
+            .and_then(Value::as_str)
+            .ok_or((StatusCode::BAD_GATEWAY, "password step failed".into()))?
+            .to_owned();
+        requests.push(accepted);
+        if name == "mfa" {
+            let valid_code = send_infra(
+                &s,
+                &make(
+                    "demo-code",
+                    source,
+                    None,
+                    Some(challenge.clone()),
+                    None,
+                    None,
+                ),
+            )
+            .await?
+            .0;
+            let wrong_code = if valid_code
+                .pointer("/body/demo_code")
+                .and_then(Value::as_str)
+                == Some("000000")
+            {
+                "000001"
+            } else {
+                "000000"
+            };
+            for _ in 0..3 {
+                requests.push(
+                    send_infra(
+                        &s,
+                        &make(
+                            "mfa",
+                            source,
+                            None,
+                            Some(challenge.clone()),
+                            Some(wrong_code.into()),
+                            None,
+                        ),
+                    )
+                    .await?
+                    .0,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            }
+        } else {
+            let code = send_infra(
+                &s,
+                &make(
+                    "demo-code",
+                    source,
+                    None,
+                    Some(challenge.clone()),
+                    None,
+                    None,
+                ),
+            )
+            .await?
+            .0;
+            let valid = code
+                .pointer("/body/demo_code")
+                .and_then(Value::as_str)
+                .ok_or((StatusCode::BAD_GATEWAY, "demo code unavailable".into()))?
+                .to_owned();
+            let completed = send_infra(
+                &s,
+                &make("mfa", source, None, Some(challenge), Some(valid), None),
+            )
+            .await?
+            .0;
+            let token = completed
+                .pointer("/body/token")
+                .and_then(Value::as_str)
+                .ok_or((StatusCode::BAD_GATEWAY, "MFA step failed".into()))?
+                .to_owned();
+            requests.push(completed);
+            if name == "normal" {
+                for action in [
+                    "session",
+                    "session",
+                    "session",
+                    "operations",
+                    "reports",
+                    "inventory",
+                ] {
+                    requests.push(
+                        send_infra(
+                            &s,
+                            &make(action, source, None, None, None, Some(token.clone())),
+                        )
+                        .await?
+                        .0,
+                    );
+                }
+            }
+        }
+    } else {
+        let action = if name == "bruteforce" {
+            "password-a"
+        } else {
+            "password"
+        };
+        let count = if name == "bruteforce" { 6 } else { 5 };
+        for _ in 0..count {
+            requests.push(
+                send_infra(
+                    &s,
+                    &make(action, "attacker-lab", Some("wrong"), None, None, None),
+                )
+                .await?
+                .0,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        }
+    }
+    Ok(Json(
+        serde_json::json!({"scenario":name,"requests":requests}),
+    ))
+}
 async fn events(State(s): State<AppState>) -> ApiResult<Vec<SecurityEvent>> {
     Ok(Json(db::events(&s.db).await.map_err(internal)?))
 }
 async fn add_event(State(s): State<AppState>, Json(e): Json<SecurityEvent>) -> ApiResult<Value> {
+    let mut e = e;
+    e.origin = Some("direct_api".into());
     s.tx.send(vec![e]).await.map_err(internal)?;
     Ok(Json(serde_json::json!({"queued":1})))
+}
+#[derive(Deserialize)]
+struct IngestBatch {
+    events: Vec<SecurityEvent>,
+}
+async fn ingest_events(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(mut batch): Json<IngestBatch>,
+) -> ApiResult<Value> {
+    let source = ingest_source(&s, &headers)?;
+    if batch.events.is_empty() || batch.events.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "1-100 events required".into()));
+    }
+    for e in &mut batch.events {
+        e.hostname = Some(source.clone());
+        e.origin = Some(format!("agent:{source}"));
+    }
+    let count = batch.events.len();
+    s.tx.send(batch.events).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"queued":count,"source":source})))
 }
 async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> ApiResult<Value> {
     let mut batch = Vec::new();
     let mut rejected = 0;
+    let mut duplicates = 0;
+    let mut seen = std::collections::HashSet::new();
     while let Some(field) = multipart.next_field().await.map_err(bad)? {
         let filename = field.file_name().unwrap_or("logs.txt");
         if ![".log", ".txt", ".jsonl"]
@@ -329,22 +752,119 @@ async fn upload(State(s): State<AppState>, mut multipart: Multipart) -> ApiResul
         let text = std::str::from_utf8(&bytes).map_err(bad)?;
         for line in text.lines().take(5000) {
             match parse_line(line) {
-                Ok(e) => batch.push(e),
+                Ok(mut e) => {
+                    if !seen.insert(e.id)
+                        || sqlx::query("SELECT 1 FROM events WHERE id=?")
+                            .bind(e.id.to_string())
+                            .fetch_optional(&s.db)
+                            .await
+                            .map_err(internal)?
+                            .is_some()
+                    {
+                        duplicates += 1;
+                    } else {
+                        e.origin = Some("manual_upload".into());
+                        batch.push(e);
+                    }
+                }
                 Err(_) => rejected += 1,
             }
         }
     }
-    if batch.is_empty() {
+    if batch.is_empty() && duplicates == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
             "no valid security events found".into(),
         ));
     }
     let count = batch.len();
-    s.tx.send(batch).await.map_err(internal)?;
+    if !batch.is_empty() {
+        s.tx.send(batch).await.map_err(internal)?;
+    }
     Ok(Json(
-        serde_json::json!({"queued":count,"rejected":rejected}),
+        serde_json::json!({"accepted":count,"rejected":rejected,"duplicates":duplicates,"origin":"manual_upload","automatic_response":false}),
     ))
+}
+fn jsonl_download(filename: &str, events: &[SecurityEvent]) -> axum::response::Response {
+    let mut content = String::new();
+    for e in events {
+        if let Ok(line) = serde_json::to_string(e) {
+            content.push_str(&line);
+            content.push('\n');
+        }
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        content,
+    )
+        .into_response()
+}
+async fn export_logs(
+    State(s): State<AppState>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let events = db::events(&s.db).await.map_err(internal)?;
+    Ok(jsonl_download("logshield-events.jsonl", &events))
+}
+async fn sample_logs(Path(name): Path<String>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut events = match name.as_str() {
+        "normal" | "bruteforce" | "distributed" | "multistage" => {
+            logshield_core::demo::scenario(&name)
+        }
+        "mfa" => {
+            let mut v = Vec::new();
+            for i in 0..3 {
+                let mut e = SecurityEvent::new(
+                    logshield_core::event::EventType::MfaFailure,
+                    Utc::now() + chrono::Duration::seconds(i * 8),
+                    "example-source",
+                    "example-auth",
+                );
+                e.username = Some("demo".into());
+                e.service = Some("mfa".into());
+                e.result = Some("failure".into());
+                e.challenge_id = Some("sample-challenge".into());
+                v.push(e);
+            }
+            v
+        }
+        "suspicious" => {
+            let mut v = logshield_core::demo::scenario("normal");
+            v.clear();
+            for (i, kind) in [
+                logshield_core::event::EventType::FailedLogin,
+                logshield_core::event::EventType::FailedLogin,
+                logshield_core::event::EventType::PasswordAccepted,
+                logshield_core::event::EventType::MfaSuccess,
+                logshield_core::event::EventType::SuccessfulLogin,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut e = SecurityEvent::new(
+                    kind,
+                    Utc::now() + chrono::Duration::seconds(i as i64 * 7),
+                    "example-source",
+                    "example-auth",
+                );
+                e.username = Some("demo".into());
+                e.service = Some("auth".into());
+                e.result = Some(if i < 2 { "failure" } else { "success" }.into());
+                v.push(e);
+            }
+            v
+        }
+        _ => return Err((StatusCode::NOT_FOUND, "unknown sample".into())),
+    };
+    for e in &mut events {
+        e.origin = Some("sample_file".into());
+    }
+    Ok(jsonl_download(&format!("logshield-{name}.jsonl"), &events))
 }
 async fn entities(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
     let rows=sqlx::query("SELECT kind,value,first_seen,last_seen,event_count FROM entities ORDER BY event_count DESC LIMIT 100").fetch_all(&s.db).await.map_err(internal)?;
@@ -369,6 +889,15 @@ async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> A
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "lab gateway not configured".into(),
+        ));
+    }
+    if i.events
+        .iter()
+        .any(|e| e.origin.as_deref() == Some("manual_upload"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "manual uploads cannot control the lab gateway".into(),
         ));
     }
     if i.response.is_some() {

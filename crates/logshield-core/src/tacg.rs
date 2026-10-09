@@ -42,6 +42,11 @@ fn transition(a: EventType, b: EventType) -> f64 {
     match (a, b) {
         (FailedLogin, FailedLogin) => 0.55,
         (FailedLogin, SuccessfulLogin) => 1.0,
+        (FailedLogin, PasswordAccepted) => 0.9,
+        (PasswordAccepted, MfaFailure) => 0.7,
+        (MfaFailure, MfaFailure) => 0.75,
+        (MfaFailure, MfaSuccess) => 1.0,
+        (MfaSuccess, SuccessfulLogin) => 0.9,
         (SuccessfulLogin, PrivilegeAction) => 1.0,
         (PrivilegeAction, UnusualNetworkActivity) => 1.0,
         (MultiPortActivity, FailedLogin) => 0.85,
@@ -54,6 +59,7 @@ fn suspicious(t: EventType) -> bool {
     matches!(
         t,
         EventType::FailedLogin
+            | EventType::MfaFailure
             | EventType::MultiPortActivity
             | EventType::PrivilegeAction
             | EventType::UnusualNetworkActivity
@@ -88,12 +94,19 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 })
                 .cloned()
                 .collect();
-            if !group.iter().any(|e| suspicious(e.event_type)) {
+            if !group
+                .iter()
+                .any(|e| suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
+            {
                 continue;
             }
             let failures = group
                 .iter()
                 .filter(|e| e.event_type == EventType::FailedLogin)
+                .count();
+            let mfa_failures = group
+                .iter()
+                .filter(|e| e.event_type == EventType::MfaFailure)
                 .count();
             let hosts: HashSet<_> = group
                 .iter()
@@ -145,11 +158,72 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 && has(EventType::UnusualNetworkActivity);
             let brute = failures >= 6;
             let distributed = cross >= 1.0;
-            if !(brute || distributed || full_chain || has(EventType::UnauthorizedAccess)) {
+            let repeated_mfa = group
+                .iter()
+                .filter(|e| e.event_type == EventType::MfaFailure)
+                .any(|anchor_mfa| {
+                    group
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == EventType::MfaFailure
+                                && e.username == anchor_mfa.username
+                                && (e.timestamp - anchor_mfa.timestamp).num_seconds().abs() <= 300
+                        })
+                        .count()
+                        >= 3
+                });
+            let success_after_failures = group
+                .iter()
+                .filter(|e| e.event_type == EventType::SuccessfulLogin)
+                .any(|login| {
+                    group
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == EventType::FailedLogin
+                                && e.username == login.username
+                                && e.timestamp < login.timestamp
+                                && (login.timestamp - e.timestamp).num_seconds() <= 600
+                        })
+                        .count()
+                        >= 2
+                });
+            let first_group = group
+                .first()
+                .map(|e| e.timestamp)
+                .unwrap_or(anchor.timestamp);
+            let new_source_success = group.iter().any(|e| {
+                if e.event_type != EventType::SuccessfulLogin {
+                    return false;
+                }
+                let Some(user) = e.username.as_deref() else {
+                    return false;
+                };
+                let previous: Vec<_> = events
+                    .iter()
+                    .filter(|old| {
+                        old.event_type == EventType::SuccessfulLogin
+                            && old.username.as_deref() == Some(user)
+                            && old.timestamp < first_group
+                    })
+                    .collect();
+                previous.len() >= 3 && !previous.iter().any(|old| old.source_ip == e.source_ip)
+            });
+            if !(brute
+                || distributed
+                || full_chain
+                || repeated_mfa
+                || success_after_failures
+                || new_source_success
+                || has(EventType::UnauthorizedAccess))
+            {
                 continue;
             }
             let rarity = if full_chain {
                 1.0
+            } else if success_after_failures || repeated_mfa {
+                0.9
+            } else if new_source_success {
+                0.7
             } else if distributed {
                 0.8
             } else if brute {
@@ -167,8 +241,12 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             } else {
                 0.0
             };
-            let transition_score = if full_chain {
+            let transition_score = if full_chain || success_after_failures {
                 1.0
+            } else if repeated_mfa {
+                0.9
+            } else if new_source_success {
+                0.45
             } else if distributed {
                 0.75
             } else if brute {
@@ -178,6 +256,10 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             };
             let behaviour = baseline.deviation(&group).max(if full_chain {
                 0.8
+            } else if success_after_failures || repeated_mfa {
+                0.75
+            } else if new_source_success {
+                0.7
             } else if distributed {
                 0.65
             } else if brute {
@@ -187,6 +269,12 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             });
             let bonus = if full_chain {
                 25.0
+            } else if success_after_failures {
+                20.0
+            } else if repeated_mfa {
+                18.0
+            } else if new_source_success {
+                5.0
             } else if distributed {
                 8.0
             } else if brute {
@@ -216,6 +304,19 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             if brute {
                 reasons.push("repeated authentication failures in a 10-minute window".into());
             }
+            if repeated_mfa {
+                reasons.push(format!(
+                    "{mfa_failures} failed MFA checks linked to the account and source"
+                ));
+            }
+            if success_after_failures {
+                reasons.push("completed login after nearby password failures".into());
+            }
+            if new_source_success {
+                reasons.push(
+                    "completed login from a source absent from established account history".into(),
+                );
+            }
             if edges.len() > 1 {
                 reasons.push(format!("{} time-decayed graph links", edges.len()));
             }
@@ -231,8 +332,10 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             let confidence = (70
                 + if full_chain {
                     24
-                } else if distributed {
+                } else if distributed || success_after_failures || repeated_mfa {
                     18
+                } else if new_source_success {
+                    8
                 } else {
                     12
                 })
@@ -261,6 +364,12 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                     "DISTRIBUTED AUTHENTICATION ATTACK".into()
                 } else if full_chain {
                     "MULTI-STAGE INTRUSION".into()
+                } else if success_after_failures {
+                    "SUSPICIOUS SUCCESSFUL LOGIN".into()
+                } else if repeated_mfa {
+                    "REPEATED MFA FAILURES".into()
+                } else if new_source_success {
+                    "UNUSUAL SUCCESSFUL LOGIN".into()
                 } else if brute {
                     "BRUTE FORCE AUTHENTICATION".into()
                 } else {
@@ -326,5 +435,59 @@ mod tests {
     fn brute_force_detected() {
         let e = scenario("bruteforce");
         assert!(!correlate(&e, &Baseline::default()).is_empty());
+    }
+    fn auth_event(kind: EventType, second: i64, source: &str, host: &str) -> SecurityEvent {
+        let mut e = SecurityEvent::new(
+            kind,
+            Utc::now() + chrono::Duration::seconds(second),
+            source,
+            host,
+        );
+        e.username = Some("demo".into());
+        e.service = Some("portal".into());
+        e
+    }
+    #[test]
+    fn completed_login_after_failures_is_suspicious() {
+        let events = vec![
+            auth_event(EventType::FailedLogin, 0, "attacker-lab", "infra-a"),
+            auth_event(EventType::FailedLogin, 5, "attacker-lab", "infra-b"),
+            auth_event(EventType::PasswordAccepted, 10, "attacker-lab", "infra-c"),
+            auth_event(EventType::MfaSuccess, 15, "attacker-lab", "infra-a"),
+            auth_event(EventType::SuccessfulLogin, 16, "attacker-lab", "infra-a"),
+        ];
+        let incident = correlate(&events, &Baseline::default()).remove(0);
+        assert_eq!(incident.kind, "SUSPICIOUS SUCCESSFUL LOGIN");
+        assert!(incident.risk >= 85);
+    }
+    #[test]
+    fn repeated_mfa_failures_are_detected() {
+        let events: Vec<_> = (0..3)
+            .map(|n| {
+                auth_event(
+                    EventType::MfaFailure,
+                    n * 6,
+                    "attacker-lab",
+                    ["infra-a", "infra-b", "infra-c"][n as usize],
+                )
+            })
+            .collect();
+        let incident = correlate(&events, &Baseline::default()).remove(0);
+        assert_eq!(incident.kind, "REPEATED MFA FAILURES");
+        assert!(incident.risk >= 85);
+    }
+    #[test]
+    fn replica_change_alone_is_not_suspicious() {
+        let events: Vec<_> = (0..3)
+            .map(|n| {
+                auth_event(
+                    EventType::SuccessfulLogin,
+                    n * 12,
+                    "normal-client",
+                    ["infra-a", "infra-b", "infra-c"][n as usize],
+                )
+            })
+            .collect();
+        assert!(correlate(&events, &Baseline::learn(&events)).is_empty());
     }
 }

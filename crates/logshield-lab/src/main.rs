@@ -8,7 +8,14 @@ use chrono::{DateTime, Duration, Utc};
 use logshield_core::event::{EventType, SecurityEvent};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use uuid::Uuid;
 
@@ -25,6 +32,7 @@ struct GatewayState {
     force_failure: Arc<Mutex<bool>>,
     log: PathBuf,
     block_file: PathBuf,
+    next_infra: Arc<AtomicUsize>,
 }
 #[derive(Clone)]
 struct AttackerState {
@@ -113,6 +121,7 @@ async fn main() {
                 force_failure: Arc::new(Mutex::new(false)),
                 log: PathBuf::from(format!("{log_dir}/gateway.log")),
                 block_file,
+                next_infra: Arc::new(AtomicUsize::new(0)),
             };
             Router::new()
                 .route(
@@ -120,9 +129,14 @@ async fn main() {
                     get(|| async { Json(serde_json::json!({"status":"ok"})) }),
                 )
                 .route("/internal/services", get(services))
+                .route("/internal/infra-status", get(infra_status))
+                .route("/internal/infra-activities", get(infra_activities))
+                .route("/internal/infra/revoke", post(infra_revoke))
+                .route("/internal/infra/session-active", post(infra_session_active))
                 .route("/internal/block", post(block))
                 .route("/internal/force-failure", post(force_failure))
                 .route("/internal/reset", post(reset_gateway))
+                .route("/infra/{*path}", post(proxy_infra))
                 .route("/{app}/{*path}", post(proxy))
                 .with_state(state)
         }
@@ -275,6 +289,9 @@ fn target(app: &str) -> Option<String> {
         "app-a" => Some(std::env::var("APP_A_URL").unwrap_or_else(|_| "http://app-a:8080".into())),
         "app-b" => Some(std::env::var("APP_B_URL").unwrap_or_else(|_| "http://app-b:8080".into())),
         "app-c" => Some(std::env::var("APP_C_URL").unwrap_or_else(|_| "http://app-c:8080".into())),
+        "infra-a" => Some("http://infra-a:8080".into()),
+        "infra-b" => Some("http://infra-b:8080".into()),
+        "infra-c" => Some("http://infra-c:8080".into()),
         _ => None,
     }
 }
@@ -288,7 +305,18 @@ async fn proxy(
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error":"unknown lab service"})),
     ))?;
-    if !["login", "lab/admin-operation", "lab/outbound"].contains(&path.as_str()) {
+    if ![
+        "login",
+        "lab/admin-operation",
+        "lab/outbound",
+        "password",
+        "mfa",
+        "session",
+        "activity",
+        "internal/demo-code",
+    ]
+    .contains(&path.as_str())
+    {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error":"fixed lab paths only"})),
@@ -341,7 +369,147 @@ async fn proxy(
         .json::<serde_json::Value>()
         .await
         .unwrap_or_else(|_| serde_json::json!({"error":"invalid app response"}));
+    if app.starts_with("infra-") {
+        let mut e = SecurityEvent::new(
+            EventType::WebRequest,
+            Utc::now(),
+            &source(&headers),
+            "gateway",
+        );
+        e.destination_ip = Some(app.clone());
+        e.service = Some("network_gateway".into());
+        e.action = Some(path.clone());
+        e.result = Some(status.as_u16().to_string());
+        e.request_id = Some(request_id(&headers));
+        e.raw_message = format!("gateway routed {path} to {app}: HTTP {status}");
+        append_log(&s.log, &e).await.map_err(server_error)?;
+    }
     Ok((status, Json(payload)))
+}
+async fn proxy_infra(
+    State(s): State<GatewayState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let (app, service_path) = match path.as_str() {
+        "password" | "mfa" | "session" | "demo-code" => {
+            let n = s.next_infra.fetch_add(1, Ordering::Relaxed) % 3;
+            (
+                ["infra-a", "infra-b", "infra-c"][n],
+                if path == "demo-code" {
+                    "internal/demo-code"
+                } else {
+                    path.as_str()
+                },
+            )
+        }
+        "password-a" => ("infra-a", "password"),
+        "operations" => ("infra-a", "activity"),
+        "reports" => ("infra-b", "activity"),
+        "inventory" => ("infra-c", "activity"),
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"fixed infra routes only"})),
+            ));
+        }
+    };
+    proxy(
+        State(s),
+        Path((app.into(), service_path.into())),
+        headers,
+        body,
+    )
+    .await
+}
+async fn infra_status(State(s): State<GatewayState>) -> Json<serde_json::Value> {
+    let mut replicas = Vec::new();
+    for app in ["infra-a", "infra-b", "infra-c"] {
+        let healthy = if let Some(base) = target(app) {
+            s.client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+        } else {
+            false
+        };
+        replicas.push(serde_json::json!({"name":app,"online":healthy}));
+    }
+    Json(
+        serde_json::json!({"replicas":replicas,"online":replicas.iter().filter(|v| v["online"] == true).count(),"total":3}),
+    )
+}
+async fn infra_activities(
+    State(s): State<GatewayState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let base = target("infra-a").ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let r = s
+        .client
+        .get(format!("{base}/internal/activities"))
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !r.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(Json(r.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?))
+}
+async fn infra_revoke(State(s): State<GatewayState>, Json(body): Json<serde_json::Value>) -> Reply {
+    let id = body
+        .get("challenge_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if Uuid::parse_str(id).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid challenge"})),
+        ));
+    }
+    let base = target("infra-a").expect("fixed infra target");
+    let r = s
+        .client
+        .post(format!("{base}/internal/revoke"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"infra unavailable"})),
+            )
+        })?;
+    Ok(Json(r.json().await.unwrap_or_default()))
+}
+async fn infra_session_active(
+    State(s): State<GatewayState>,
+    Json(body): Json<serde_json::Value>,
+) -> Reply {
+    let token = body
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if Uuid::parse_str(token).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid token"})),
+        ));
+    }
+    let base = target("infra-a").expect("fixed infra target");
+    let r = s
+        .client
+        .post(format!("{base}/internal/session-active"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"infra unavailable"})),
+            )
+        })?;
+    Ok(Json(r.json().await.unwrap_or_default()))
 }
 async fn persist_blocks(s: &GatewayState, blocks: &HashMap<String, Block>) -> std::io::Result<()> {
     if let Some(parent) = s.block_file.parent() {

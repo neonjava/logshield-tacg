@@ -11,6 +11,7 @@ pub async fn init(db: &SqlitePool) -> Result<(), sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS responses(incident_id TEXT PRIMARY KEY,status TEXT NOT NULL,payload TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS verification_attempts(id TEXT PRIMARY KEY,incident_id TEXT NOT NULL,timestamp TEXT NOT NULL,http_status INTEGER NOT NULL,blocked INTEGER NOT NULL,matched INTEGER NOT NULL,payload TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS gateway_blocks(incident_id TEXT PRIMARY KEY,source TEXT NOT NULL,expires_at TEXT NOT NULL,payload TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS source_heartbeats(source TEXT PRIMARY KEY, seen_at TEXT NOT NULL)",
     ] {
         sqlx::query(query).execute(db).await?;
     }
@@ -104,6 +105,7 @@ pub async fn clear(db: &SqlitePool) -> Result<(), sqlx::Error> {
         "incidents",
         "entities",
         "events",
+        "source_heartbeats",
     ] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&mut *tx)

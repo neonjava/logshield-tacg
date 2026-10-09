@@ -8,6 +8,9 @@ pub enum EventType {
     Connection,
     MultiPortActivity,
     FailedLogin,
+    PasswordAccepted,
+    MfaFailure,
+    MfaSuccess,
     SuccessfulLogin,
     PrivilegeAction,
     UnusualNetworkActivity,
@@ -35,6 +38,10 @@ pub struct SecurityEvent {
     #[serde(default)]
     pub request_id: Option<String>,
     #[serde(default)]
+    pub challenge_id: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
     pub raw_message: String,
 }
 impl SecurityEvent {
@@ -53,6 +60,8 @@ impl SecurityEvent {
             result: None,
             severity_hint: None,
             request_id: None,
+            challenge_id: None,
+            origin: None,
             raw_message: String::new(),
         }
     }
