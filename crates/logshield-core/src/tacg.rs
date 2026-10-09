@@ -71,10 +71,13 @@ fn suspicious(t: EventType) -> bool {
 fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64) {
     let mut previous: HashMap<&str, &SecurityEvent> = HashMap::new();
     let mut edges = Vec::new();
-    let mut longest_hosts = 0;
-    let mut longest_failures = 0;
-    let mut best_cross = 0.0;
-    let mut paths: HashMap<&str, (usize, HashSet<&str>)> = HashMap::new();
+    let failures: HashMap<Uuid, &SecurityEvent> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == EventType::FailedLogin && e.username.is_some() && e.hostname.is_some()
+        })
+        .map(|e| (e.id, e))
+        .collect();
     for event in events
         .iter()
         .filter(|e| e.event_type == EventType::FailedLogin)
@@ -82,17 +85,11 @@ fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64
         let Some(user) = event.username.as_deref() else {
             continue;
         };
-        let Some(host) = event.hostname.as_deref() else {
+        if event.hostname.is_none() {
             continue;
-        };
+        }
         let prior = previous.insert(user, event);
         let connected = prior.is_some_and(|old| temporal_strength(old, event) >= 0.35);
-        let path = paths.entry(user).or_insert_with(|| (0, HashSet::new()));
-        if !connected {
-            *path = (0, HashSet::new());
-        }
-        path.0 += 1;
-        path.1.insert(host);
         if let Some(old) = prior.filter(|_| connected) {
             let (entity, _) = entity_strength(old, event);
             edges.push(GraphEdge {
@@ -106,17 +103,50 @@ fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64
                 ],
             });
         }
-        let cross = if path.1.len() >= 3 && path.0 >= 5 {
+    }
+    let mut adjacency: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for edge in &edges {
+        adjacency.entry(edge.from).or_default().push(edge.to);
+        adjacency.entry(edge.to).or_default().push(edge.from);
+    }
+    let mut visited = HashSet::new();
+    let mut longest_hosts = 0;
+    let mut longest_failures = 0;
+    let mut best_cross = 0.0;
+    for id in failures.keys() {
+        if !visited.insert(*id) {
+            continue;
+        }
+        let mut pending = vec![*id];
+        let mut count = 0;
+        let mut hosts = HashSet::new();
+        while let Some(node) = pending.pop() {
+            count += 1;
+            if let Some(host) = failures
+                .get(&node)
+                .and_then(|event| event.hostname.as_deref())
+            {
+                hosts.insert(host);
+            }
+            if let Some(neighbors) = adjacency.get(&node) {
+                for neighbor in neighbors {
+                    if visited.insert(*neighbor) {
+                        pending.push(*neighbor);
+                    }
+                }
+            }
+        }
+        let cross = if hosts.len() >= 3 && count >= 5 {
             1.0
-        } else if path.1.len() >= 2 && path.0 >= 4 {
+        } else if hosts.len() >= 2 && count >= 4 {
             0.7
         } else {
             0.0
         };
-        if cross > best_cross || (cross == best_cross && path.0 > longest_failures) {
+        if cross > best_cross || (cross == best_cross && count > longest_failures) {
             best_cross = cross;
-            longest_failures = path.0;
-            longest_hosts = path.1.len();
+            longest_failures = count;
+            longest_hosts = hosts.len();
         }
     }
     (edges, longest_failures, longest_hosts, best_cross)
