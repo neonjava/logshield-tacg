@@ -1,5 +1,7 @@
 # LogShield workflow
 
+Editable diagrams.net file: [WORKFLOW.drawio](WORKFLOW.drawio). Open it with **File → Open from → Device** in diagrams.net, then export SVG or PDF if needed.
+
 Copy this flowchart to a slide or draw the same boxes and arrows on a sheet. The left browser window sends requests to the controlled application; the right window displays the SDK log stream and investigation.
 
 ```mermaid
