@@ -16,6 +16,7 @@ export function SdkLogs({
 }) {
   const [server, setServer] = useState("all");
   const [query, setQuery] = useState("");
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [status, setStatus] = useState<InfraHealth | null>(null);
   useEffect(() => {
     let active = true;
@@ -35,14 +36,14 @@ export function SdkLogs({
     };
   }, []);
 
-  const agentEvents = useMemo(
+  const liveEvents = useMemo(
     () =>
       store.events
-        .filter((event) => event.origin?.startsWith("agent:infra-"))
+        .filter((event) => event.origin === "lab_sensor" || event.origin?.startsWith("agent:infra-"))
         .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)),
     [store.events],
   );
-  const visible = agentEvents
+  const visible = liveEvents
     .filter((event) => server === "all" || event.hostname === server)
     .filter((event) =>
       [
@@ -62,7 +63,7 @@ export function SdkLogs({
     <>
       <Heading
         title="SDK Live Logs"
-        description="Application logs delivered by the three Rust agents. Manual uploads and generated demo events are excluded."
+        description="Actual application log lines read by the Rust file sensor or three Rust agents. Manual uploads are excluded."
         action={
           <span className={`connection ${store.live ? "online" : ""}`}>
             <i />
@@ -75,7 +76,7 @@ export function SdkLogs({
           const online = status?.agents.find(
             (item) => item.name === name,
           )?.online;
-          const count = agentEvents.filter(
+          const count = liveEvents.filter(
             (event) => event.hostname === name,
           ).length;
           return (
@@ -92,9 +93,10 @@ export function SdkLogs({
           );
         })}
       </div>
+      <p className="sdk-source-note">Sample app-a/b/c requests appear as <strong>lab_sensor</strong>. Shared portal infra-a/b/c requests appear as <strong>agent:infra-*</strong>. Open the app and this dashboard on the same port so they use the same backend.</p>
       <Card
-        title="Agent-delivered event stream"
-        subtitle="Each row is an application log normalized by the Rust agent and accepted by LogShield. New records appear automatically."
+        title="Live application log files"
+        subtitle="Application writes JSON to its log file → Rust sensor or agent reads the new line → LogShield stores it. The original written line is shown below."
         action={
           <button className="button small" onClick={() => void store.refresh()}>
             <RefreshCw size={14} /> Refresh
@@ -102,8 +104,8 @@ export function SdkLogs({
         }
       >
         <div className="sdk-stream-meta">
-          <span>{agentEvents.length} agent logs stored</span>
-          <span>Latest: {time(agentEvents[0]?.timestamp)}</span>
+          <span>{liveEvents.length} live logs stored</span>
+          <span>Latest: {time(liveEvents[0]?.timestamp)}</span>
           <span>
             {store.live ? "WebSocket connected" : "Polling while reconnecting"}
           </span>
@@ -123,12 +125,15 @@ export function SdkLogs({
             value={server}
             onChange={(event) => setServer(event.target.value)}
           >
-            <option value="all">All three servers</option>
+            <option value="all">All live sources</option>
             {SERVERS.map((name) => (
               <option value={name} key={name}>
                 {name}
               </option>
             ))}
+            <option value="app-a">Sample app-a</option>
+            <option value="app-b">Sample app-b</option>
+            <option value="app-c">Sample app-c</option>
           </select>
         </div>
         {visible.length ? (
@@ -147,10 +152,7 @@ export function SdkLogs({
               </thead>
               <tbody>
                 {visible.map((event) => (
-                  <tr
-                    key={event.id}
-                    className={isFailure(event) ? "failed-row" : ""}
-                  >
+                  <tr key={event.id} className={isFailure(event) ? "failed-row" : ""}>
                     <td className="mono">{time(event.timestamp)}</td>
                     <td>
                       <strong>
@@ -176,11 +178,15 @@ export function SdkLogs({
                     <td>
                       <button
                         className="sdk-raw-link"
-                        onClick={() => onEvent(event)}
-                        title="Open complete raw event"
+                        onClick={() => setExpanded(expanded === event.id ? null : event.id)}
+                        aria-expanded={expanded === event.id}
+                        title="Show original application log line"
                       >
-                        {event.raw_message || "—"}
+                        {expanded === event.id ? "Hide raw log" : "Show raw log"}
                       </button>
+                      {expanded === event.id && (
+                        <pre className="sdk-raw-record">{event.raw_message || "No raw line stored"}</pre>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -190,14 +196,14 @@ export function SdkLogs({
         ) : (
           <Empty
             title={
-              agentEvents.length
-                ? "No matching agent logs"
+              liveEvents.length
+                ? "No matching live logs"
                 : "Waiting for application logs"
             }
             text={
-              agentEvents.length
+              liveEvents.length
                 ? "Try another server or search term."
-                : "Run a normal login or controlled test on the Infrastructure page. The three application agents will deliver their actual logs here."
+                : "Send a request to a sample app or run a controlled test on Infrastructure. Use the same dashboard port as the app."
             }
           />
         )}

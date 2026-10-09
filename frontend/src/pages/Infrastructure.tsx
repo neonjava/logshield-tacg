@@ -148,6 +148,11 @@ export function Infrastructure({ store }: { store: SecurityStore }) {
       <Heading
         title="Infrastructure"
         description="One application behind three Rust servers, with shared sessions and real log agents."
+        action={
+          <a className="button small" href="/#sdk-logs" target="_blank" rel="noopener noreferrer">
+            Open matching live logs <ArrowRight size={14} />
+          </a>
+        }
       />
       <div className="safety-note">
         <ShieldCheck size={18} />
