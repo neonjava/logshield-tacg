@@ -1,4 +1,6 @@
 pub use logshield_core::event::{EventType, SecurityEvent};
+mod queue;
+pub use queue::{DurableIngestQueue, QueueError};
 
 /// Create a timestamped event. Set the remaining optional fields before sending.
 pub fn new_event(event_type: EventType, source: &str, host: &str) -> SecurityEvent {

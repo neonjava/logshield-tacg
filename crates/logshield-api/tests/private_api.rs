@@ -1,4 +1,5 @@
 //! Exercises the actual non-lab Axum server, including WebSocket upgrade auth.
+use logshield_ingest::{DurableIngestQueue, EventType, IngestClient, QueueError, new_event};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use std::{
@@ -261,5 +262,103 @@ async fn private_mode_auth_ingest_and_restart() {
         .await
         .unwrap();
     assert_eq!(deduplicated.as_array().unwrap().len(), 1);
+    drop(server);
+}
+
+#[tokio::test]
+async fn durable_sdk_queue_replays_after_offline_period() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let directory = std::env::temp_dir().join(format!("logshield-queue-{}", Uuid::new_v4()));
+    let _cleanup = TestDir(directory.clone());
+    let operator = Uuid::new_v4().simple().to_string();
+    let source = Uuid::new_v4().simple().to_string();
+    let base = format!("http://127.0.0.1:{port}");
+    let event = new_event(EventType::WebRequest, "client", "claimed-host");
+    let queue = DurableIngestQueue::new(
+        IngestClient::new(&base, &source),
+        directory.join("spool"),
+        1,
+    )
+    .unwrap();
+    queue.enqueue(std::slice::from_ref(&event)).await.unwrap();
+    assert!(matches!(
+        queue.enqueue(std::slice::from_ref(&event)).await,
+        Err(QueueError::Full)
+    ));
+    assert!(matches!(queue.flush().await, Err(QueueError::Delivery(_))));
+    assert_eq!(queue.pending_batches().await.unwrap(), 1);
+    drop(queue);
+
+    let queue = DurableIngestQueue::new(
+        IngestClient::new(&base, &source),
+        directory.join("spool"),
+        1,
+    )
+    .unwrap();
+    assert_eq!(queue.pending_batches().await.unwrap(), 1);
+    let server = Server::start(port, directory.clone(), &operator, &source);
+    let client = Client::new();
+    ready(&client, &base).await;
+    assert_eq!(queue.flush().await.unwrap(), 1);
+    assert_eq!(queue.pending_batches().await.unwrap(), 0);
+    let events: Value = client
+        .get(format!("{base}/api/events"))
+        .bearer_auth(&operator)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events.as_array().unwrap().len(), 1);
+    assert_eq!(events[0]["id"], event.id.to_string());
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "manual synthetic ingest measurement; use --ignored --nocapture"]
+async fn synthetic_private_ingest_throughput() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let directory = std::env::temp_dir().join(format!("logshield-load-{}", Uuid::new_v4()));
+    let _cleanup = TestDir(directory.clone());
+    let operator = Uuid::new_v4().simple().to_string();
+    let source = Uuid::new_v4().simple().to_string();
+    let base = format!("http://127.0.0.1:{port}");
+    let server = Server::start(port, directory.clone(), &operator, &source);
+    ready(&Client::new(), &base).await;
+    let sdk = IngestClient::new(&base, &source);
+    let start = std::time::Instant::now();
+    let mut latencies = Vec::new();
+    for _ in 0..50 {
+        let batch: Vec<_> = (0..100)
+            .map(|_| new_event(EventType::WebRequest, "load-client", "private-app"))
+            .collect();
+        let sent = std::time::Instant::now();
+        let receipt = sdk.send(&batch).await.unwrap();
+        assert!(receipt.durable);
+        latencies.push(sent.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    latencies.sort_by(f64::total_cmp);
+    let database = format!("sqlite://{}", directory.join("events.db").display());
+    let pool = sqlx::SqlitePool::connect(&database).await.unwrap();
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(persisted, 5_000);
+    println!(
+        "synthetic localhost ingest: {persisted} events in {seconds:.2}s ({:.0} events/s), batch p50 {:.1}ms, p95 {:.1}ms; sequential 100-event batches, single API process, SQLite, no attack mix",
+        persisted as f64 / seconds,
+        latencies[24],
+        latencies[47],
+    );
+    pool.close().await;
     drop(server);
 }

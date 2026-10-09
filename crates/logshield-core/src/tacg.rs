@@ -200,6 +200,14 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
     }
     let mut incidents = Vec::new();
     for (source, all) in groups {
+        // No candidate anchor in this source can produce an incident. Skip
+        // the quadratic window search while keeping these events in baseline learning.
+        if !all
+            .iter()
+            .any(|e| suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
+        {
+            continue;
+        }
         let mut used = HashSet::new();
         for anchor in &all {
             if used.contains(&anchor.id) {
