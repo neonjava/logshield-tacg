@@ -16,7 +16,9 @@ Organizations generate more logs than a person can inspect in time. A single fai
 
 LogShield normalizes incoming records into typed security events, builds a **Temporal Attack Correlation Graph (TACG)**, and calculates an explicit risk score. Events become nodes. Time-decayed edges link events with a common source, account, host, service, request, or meaningful transition. The graph reconstructs an attack sequence and produces an incident with raw logs, relationships, score contributions, and recommended actions. The score is computed in Rust rather than hidden behind an LLM.
 
-The risk calculation weights event rarity (20), temporal strength (20), entity relationship (15), transition risk (20), cross-host activity (10), and behavior deviation (15), then applies an explained chain bonus. Risk levels are low (0–39), medium (40–69), high (70–84), and critical (85–100). Automatic action also requires sufficient confidence and an **approved local response adapter**.
+The risk calculation weights event rarity (20), temporal strength (20), entity relationship (15), transition risk (20), cross-host activity (10), and behavior deviation (15), then applies an explained chain bonus. Risk levels are low (0–39), medium (40–69), high (70–84), and critical (85–100). Automatic action also requires sufficient **rule-based evidence strength** and an **approved local response adapter**. The API retains the field name `confidence` for compatibility; it is a score out of 100, **not** a probability that the activity is malicious.
+
+Distributed detection requires a connected, time-decayed path of same-account failures across hosts; a centralized source counter alone cannot trigger that rule. Multi-stage detection enforces failure → success → privilege action → outbound activity in chronological order. A familiar account/source/host history lowers the distributed pattern below automatic containment while retaining an alert. The [small labeled comparison](docs/EVALUATION.md) gives reproducible fixture results and their limits.
 
 ## Two local demonstration environments
 
@@ -57,7 +59,7 @@ This extension will demonstrate three primary detections: **brute-force password
 
 ## Log sources and provenance
 
-Automatic collection is the main path. The verified lab uses a read-only file sensor; the new extension uses per-server agents and a typed Rust ingestion SDK. The Events page already accepts limited UTF-8 `.log`, `.txt`, and `.jsonl` uploads. The planned Logs & Events view will add downloadable safe samples and an export of current records. Manual uploads are for parsing and investigation demos: they can create explained incidents but **must never authorize automatic containment**. Live agent credentials are generated locally and must not be committed.
+Automatic collection is the main path. The lab uses a read-only file sensor; the shared-portal infrastructure uses per-server agents and a typed Rust ingestion SDK. The Events page accepts limited UTF-8 `.log`, `.txt`, and `.jsonl` uploads, offers safe downloadable samples, and exports stored records. Manual uploads can create explained incidents but **never authorize automatic containment**. Live agent credentials are generated locally and must not be committed.
 
 The ingestion path validates input size and format, never executes log contents, and stores evidence with source provenance. No uploaded record should be trusted to claim the identity of an authenticated agent.
 
@@ -75,7 +77,7 @@ Docker networks isolate the lab. The API is published only on localhost; the gat
 
 Prerequisites: stable Rust, Cargo, Docker with Compose, Node 22+, and npm. The Dockerfile packages host-built Fedora 44 x86-64 Rust binaries; another host platform needs compatible Linux builds or a Dockerfile adaptation.
 
-After the extension compiles, the intended startup is:
+Start the local lab with:
 
 ```bash
 cd /path/to/logshield
@@ -88,11 +90,11 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The local API is `http://127.0.0.1:3000`. The infrastructure extension is still being validated; follow the test results before using it for a presentation. `docker compose down` retains data volumes. `docker compose down -v` erases **this project's** lab and database volumes.
+Open `http://127.0.0.1:5173`. The local API is `http://127.0.0.1:3000`. `docker compose down` retains data volumes. `docker compose down -v` erases **this project's** lab and database volumes.
 
 ## Current API and demonstrations
 
-The verified REST API includes `/api/status`, `/api/stats`, `/api/events`, `/api/incidents`, `/api/entities`, `/api/responses`, `/api/logs/upload`, and the fixed `/api/lab/*` scenario controls. `/ws/events` streams live updates. The infrastructure extension adds authenticated event ingestion and fixed `/api/infra/*` controls; those routes are not considered verified until integration tests pass.
+The REST API includes `/api/status`, `/api/stats`, `/api/events`, `/api/incidents`, `/api/entities`, `/api/responses`, `/api/logs/upload`, and the fixed `/api/lab/*` scenario controls. `/ws/events` streams live updates. Authenticated agent ingestion and fixed `/api/infra/*` controls are exercised by the Docker integration test.
 
 For the original two-minute demonstration, see [docs/DEMO.md](docs/DEMO.md). For design and judge explanations, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/TACG.md](docs/TACG.md), [docs/REAL_WORLD_PROBLEM.md](docs/REAL_WORLD_PROBLEM.md), and [docs/PITCH.md](docs/PITCH.md).
 
@@ -107,8 +109,8 @@ cargo test -p logshield-api --test lab_e2e -- --ignored
 cd frontend && npm run build
 ```
 
-The Docker integration test needs the release binaries and Compose image built first. The completed infrastructure work must additionally prove shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, the three headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure.
+The Docker integration test needs the release binaries and Compose image built first. It exercises shared sessions across replicas, PostgreSQL activity persistence, agent-authenticated log delivery, headline detections, normal-traffic protection, uploaded-log provenance, and verified containment or failure. GitHub Actions runs formatting, Clippy, unit tests, and the frontend build on push; the Docker integration job can be launched manually. The [small labeled comparison](docs/EVALUATION.md) is a rule regression check, not a representative benchmark.
 
 ## Known limitations and next steps
 
-The original lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. It is designed for a safe demonstration, not arbitrary network traffic. Its gateway identity and API access model need authenticated deployment controls before use with real organizations. The new Redis/PostgreSQL/agent infrastructure is under implementation and must not be presented as tested until its end-to-end gates pass. Future production work includes tenant isolation, secret management, authenticated operators, durable agent enrollment and rotation handling, calibrated baselines, and human-reviewed response policy.
+The lab uses controlled source labels, fixed dummy credentials, and a polling file sensor. It is designed for a safe demonstration, not arbitrary network traffic. Operator authentication and trustworthy source attribution are required before use with real organizations. The API still loads a bounded recent event set and recomputes correlations after batches; sustained-volume latency is unmeasured. Future production work includes tenant isolation, secret management, durable agent enrollment and rotation handling, representative labeled-data evaluation, calibrated baselines, incremental correlation, and human-reviewed response policy.
