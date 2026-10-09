@@ -35,6 +35,11 @@ If the detector classified any new-source login as an attack, remote employees a
 
 LogShield resolves this by scoring single new-source logins as **Medium-tier behavioral anomalies** (risk score 50–65) rather than High or Critical threats. This alerts SOC analysts in the dashboard without triggering automatic gateway blocking (`benign_critical = 0`).
 
+### Cold-Start Sensitivity & Training Cutoff
+To prevent evaluation events or active attack probing from poisoning the baseline, LogShield enforces `Baseline::learn_with_cutoff` with a boundary of $T_{\text{latest}} - 600\,\text{s}$ and excludes any events associated with active incidents.
+- **Operating Boundary:** Events that occurred within the past 10 minutes cannot contribute to the user's familiarity profile. An organization spinning up LogShield from cold storage requires at least 10–30 minutes of historical benign operation before familiar-user discounting becomes active.
+- **Poisoning Boundary:** While active incident event IDs and known suspicious event types (`FailedLogin`, `PrivilegeAction`, etc.) are excluded, if an attacker executes a slow, subtle reconnaissance login from a compromised IP before any incident is flagged, that IP could theoretically be recorded in the known IP set. Operators should periodically prune baseline tables or review newly registered IPs.
+
 ---
 
 ## 3. Scope Boundary: Correlation vs. Inline Packet/Payload Inspection

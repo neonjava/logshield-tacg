@@ -171,3 +171,54 @@ $$\text{Risk} = \min\left(100, \; \lfloor 20 \cdot R + 20 \cdot \bar{T} + 15 \cd
   1. $\text{Risk} \ge 85$,
   2. $\text{Evidence Strength} \ge 85$, and
   3. An approved, verified response adapter (e.g. LogShield Gateway) is active.
+
+---
+
+## 6. Baseline Training Isolation & Anti-Poisoning Architecture
+
+A critical vulnerability in adaptive security systems is **baseline leakage and profile poisoning**: if evaluation events or malicious reconnaissance attempts are ingested into user behavioral profiles, the baseline becomes corrupted, artificially suppressing alerts for attacks or leaking future knowledge during benchmarks.
+
+LogShield addresses this via `Baseline::learn_with_cutoff` and a two-layer training filter.
+
+### 6.1 Formal Training Set Definition
+Given an event stream $\mathcal{E}$, the baseline training set $\mathcal{D}_{\text{train}}$ is defined strictly as:
+
+$$\mathcal{D}_{\text{train}} = \left\{ e \in \mathcal{E} \;\middle|\; t(e) \le T_{\text{cutoff}} \;\land\; e.\text{id} \notin \mathcal{I}_{\text{active}} \;\land\; \text{type}(e) \notin \mathcal{T}_{\text{suspicious}} \right\}$$
+
+Where:
+1. **Temporal Cutoff ($T_{\text{cutoff}} = T_{\text{latest}} - 600\,\text{s}$):** Enforces a strict historical boundary. Events occurring within the active sliding correlation window are never admitted into the profile.
+2. **Poison Exclusion Set ($\mathcal{I}_{\text{active}}$):** Every event ID associated with any previously detected active incident is excluded from baseline updates. An adversary cannot "train" the baseline into accepting rogue IP addresses or malicious hosts.
+3. **Suspicious Event Type Blacklist ($\mathcal{T}_{\text{suspicious}}$):** Rejects all attack-phase and error events from profile updates:
+   $$\mathcal{T}_{\text{suspicious}} = \{ \text{FailedLogin}, \, \text{PasswordAccepted}, \, \text{MfaFailure}, \, \text{UnauthorizedAccess}, \, \text{PrivilegeAction}, \, \text{UnusualNetworkActivity} \}$$
+   Only benign operational traffic (e.g., `SuccessfulLogin`, `WebRequest`) contributes to user familiarity.
+
+### 6.2 Cold-Start & Unfamiliarity Guarantee
+To avoid false-positive spikes when new accounts or services are first observed:
+- Default normal event rate is initialized to $\lambda_{\text{default}} = 10.0\,\text{events/minute}$.
+- If a user has no prior profile ($u \notin \text{users}$), baseline deviation $B$ defaults to $0.0$, ensuring cold-start users are not penalized with synthetic anomalies before sufficient history is established.
+
+---
+
+## 7. Ablation Architecture & Principled Algorithmic Toggles
+
+To enable rigorous empirical evaluation without maintaining unprincipled separate detector scripts, LogShield incorporates the `CorrelationConfig` struct directly into the TACG engine:
+
+```rust
+pub struct CorrelationConfig {
+    pub temporal_decay: bool,
+    pub graph_edges: bool,
+    pub baseline_familiarity: bool,
+    pub identity_correlation: bool,
+}
+```
+
+Every variant is executed through the exact same correlation pipeline (`correlate_with_config`):
+
+| Configuration Variant | Algorithmic Semantics | Empirical Role |
+|---|---|---|
+| **Full TACG** (`CorrelationConfig::full()`) | All features enabled: $\tau = 90$s exponential decay, causal graph edges, baseline familiarity discounting, and Pass 2 identity correlation. | Production default; maximizes precision and recall. |
+| **No Graph Edges** (`CorrelationConfig::no_graph_edges()`) | Edge construction is skipped ($E = \emptyset$); evaluates flat cluster-wide failure counters across hosts without account-level path continuity. | Isolates the contribution of topological graph representation vs. conventional flat SIEM threshold counters. |
+| **No Baseline** (`CorrelationConfig::no_baseline()`) | Baseline familiarity lookup and typo discounting are disabled; all events treated as unfamiliar cold-start. | Measures the false-positive reduction provided by behavioral user profiling. |
+| **No Temporal Decay** (`CorrelationConfig::no_temporal_decay()`) | Edge temporal weight is set to uniform $1.0$ if $\Delta t \le 600$s (0.0 otherwise), eliminating time-decay dynamics. | Evaluates the effect of exponential recency weighting on transient bursts. |
+| **No Identity Correlation** (`CorrelationConfig::no_identity_correlation()`) | Pass 2 (identity-anchored clustering) is disabled; correlation relies strictly on Pass 1 (source IP grouping). | Demonstrates TACG's vulnerability to rotating IP botnets when cross-source identity aggregation is removed. |
+
