@@ -172,4 +172,35 @@ async fn real_logs_gateway_containment_and_failure() {
     .await;
     assert_eq!(verify["verification_attempts"][0]["status"], 401);
     assert_ne!(i["status"], "CONTAINED");
+
+    // Manual requests from the three visible sample pages use the same real log path.
+    post(&client, "/lab/clear").await;
+    for app in ["app-a", "app-a", "app-b", "app-b", "app-c"] {
+        let attempt = client
+            .post(format!("{API}/lab/attempt"))
+            .json(&serde_json::json!({
+                "app": app,
+                "operation": "login",
+                "source": "attacker-lab",
+                "password": "wrong"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(attempt["attempt"]["status"], 401);
+    }
+    let manual_incident = wait_for(&client, "/incidents", |v| {
+        v.as_array().is_some_and(|items| {
+            items.iter().any(|i| {
+                i["kind"] == "DISTRIBUTED AUTHENTICATION ATTACK" && i["status"] == "CONTAINED"
+            })
+        })
+    })
+    .await;
+    assert!(manual_incident[0]["risk"].as_u64().unwrap_or(0) >= 85);
 }

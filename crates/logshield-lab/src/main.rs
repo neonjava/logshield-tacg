@@ -54,6 +54,13 @@ struct Login {
 struct FailureToggle {
     enabled: bool,
 }
+#[derive(Deserialize)]
+struct ManualAttempt {
+    app: String,
+    operation: String,
+    source: String,
+    password: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 struct Attempt {
     status: u16,
@@ -131,6 +138,7 @@ async fn main() {
                     get(|| async { Json(serde_json::json!({"status":"ok"})) }),
                 )
                 .route("/run/{name}", post(run))
+                .route("/attempt", post(manual_attempt))
                 .route("/verify", post(verify))
                 .with_state(state)
         }
@@ -477,4 +485,27 @@ async fn run(State(s): State<AttackerState>, Path(name): Path<String>) -> Reply 
 }
 async fn verify(State(s): State<AttackerState>) -> Json<Attempt> {
     Json(attempt(&s, "app-a", "login", Some("incorrect"), "attacker-lab").await)
+}
+async fn manual_attempt(State(s): State<AttackerState>, Json(body): Json<ManualAttempt>) -> Reply {
+    if !["app-a", "app-b", "app-c"].contains(&body.app.as_str())
+        || !["login", "lab/admin-operation", "lab/outbound"].contains(&body.operation.as_str())
+        || !["attacker-lab", "normal-client"].contains(&body.source.as_str())
+        || body.password.as_ref().is_some_and(|p| p.len() > 128)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"fixed local lab targets and operations only"})),
+        ));
+    }
+    let password = if body.operation == "login" {
+        Some(body.password.as_deref().unwrap_or(""))
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "app":body.app,
+        "operation":body.operation,
+        "source":body.source,
+        "attempt":attempt(&s, &body.app, &body.operation, password, &body.source).await
+    })))
 }

@@ -98,6 +98,7 @@ async fn main() {
         .route("/api/responses", get(responses))
         .route("/api/stats", get(stats))
         .route("/api/lab/run/{name}", post(run_lab))
+        .route("/api/lab/attempt", post(lab_attempt))
         .route("/api/lab/force-failure", post(force_failure))
         .route("/api/lab/clear", post(clear_lab))
         .route("/ws/events", get(ws))
@@ -479,6 +480,41 @@ async fn run_lab(State(s): State<AppState>, Path(name): Path<String>) -> ApiResu
         return Err((StatusCode::BAD_GATEWAY, body.to_string()));
     }
     Ok(Json(body))
+}
+#[derive(Deserialize, Serialize)]
+struct LabAttempt {
+    app: String,
+    operation: String,
+    source: String,
+    password: Option<String>,
+}
+async fn lab_attempt(State(s): State<AppState>, Json(body): Json<LabAttempt>) -> ApiResult<Value> {
+    if !s.lab_mode {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
+    }
+    if !["app-a", "app-b", "app-c"].contains(&body.app.as_str())
+        || !["login", "lab/admin-operation", "lab/outbound"].contains(&body.operation.as_str())
+        || !["attacker-lab", "normal-client"].contains(&body.source.as_str())
+        || body.password.as_ref().is_some_and(|p| p.len() > 128)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "fixed local lab targets and operations only".into(),
+        ));
+    }
+    let r = s
+        .client
+        .post(format!("{}/attempt", s.attacker))
+        .json(&body)
+        .send()
+        .await
+        .map_err(internal)?;
+    let status = r.status();
+    let payload = r.json::<Value>().await.map_err(internal)?;
+    if !status.is_success() {
+        return Err((StatusCode::BAD_GATEWAY, payload.to_string()));
+    }
+    Ok(Json(payload))
 }
 #[derive(Deserialize)]
 struct Toggle {
