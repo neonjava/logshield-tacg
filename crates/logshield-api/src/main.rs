@@ -138,6 +138,7 @@ async fn main() {
         .route("/api/infra/request", post(infra_request))
         .route("/api/infra/run/{name}", post(infra_run))
         .route("/api/entities", get(entities))
+        .route("/api/baseline/approve", post(approve_baseline))
         .route("/api/incidents", get(incidents))
         .route("/api/incidents/{id}", get(incident))
         .route("/api/incidents/{id}/respond", post(manual_response))
@@ -270,6 +271,7 @@ async fn worker(state: AppState, mut rx: mpsc::Receiver<WorkItem>) {
 }
 async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), String> {
     let reset_at = *state.reset_at.lock().await;
+    let mut inserted = 0_usize;
     for e in batch {
         if reset_at.is_some_and(|cutoff| {
             e.timestamp <= cutoff
@@ -281,6 +283,7 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
         }
         match db::insert_event(&state.db, e).await {
             Ok(true) => {
+                inserted += 1;
                 let _ = state
                     .broadcast
                     .send(serde_json::json!({"type":"event","event":e}).to_string());
@@ -289,7 +292,7 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
             Err(err) => return Err(format!("event insert failed: {err}")),
         }
     }
-    if batch.is_empty() {
+    if inserted == 0 {
         return Ok(());
     }
     let all = db::events(&state.db).await.map_err(|e| e.to_string())?;
@@ -308,7 +311,7 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
     let baseline = if state.lab_mode {
         Baseline::learn_with_cutoff(&all, Some(cutoff), Some(&incident_event_ids))
     } else {
-        Baseline::default()
+        db::baseline(&state.db).await?
     };
     for mut new in correlate(&all, &baseline) {
         let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
@@ -323,6 +326,7 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
         }
         if response::eligible(&new)
             && state.lab_mode
+            && new.source_ip.as_deref() == Some("attacker-lab")
             && new.events.iter().all(|e| {
                 e.origin
                     .as_deref()
@@ -850,6 +854,43 @@ async fn infra_run(State(s): State<AppState>, Path(name): Path<String>) -> ApiRe
 async fn events(State(s): State<AppState>) -> ApiResult<Vec<SecurityEvent>> {
     Ok(Json(db::events(&s.db).await.map_err(internal)?))
 }
+#[derive(Deserialize)]
+struct BaselineApproval {
+    username: String,
+    source_ip: String,
+    hostname: String,
+    reviewed_benign: bool,
+}
+async fn approve_baseline(
+    State(s): State<AppState>,
+    Json(body): Json<BaselineApproval>,
+) -> ApiResult<Value> {
+    if s.lab_mode {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "baseline approvals are private-mode only".into(),
+        ));
+    }
+    if !body.reviewed_benign
+        || [&body.username, &body.source_ip, &body.hostname]
+            .iter()
+            .any(|value| {
+                value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+            })
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a reviewed candidate with bounded identifiers is required".into(),
+        ));
+    }
+    let _guard = s.processing.lock().await;
+    let approved = db::approve_baseline(&s.db, &body.username, &body.source_ip, &body.hostname)
+        .await
+        .map_err(|message| (StatusCode::CONFLICT, message))?;
+    Ok(Json(
+        serde_json::json!({"approved":true,"version":approved.version}),
+    ))
+}
 async fn add_event(State(s): State<AppState>, Json(e): Json<SecurityEvent>) -> ApiResult<Value> {
     let mut e = e;
     e.origin = Some("direct_api".into());
@@ -1062,6 +1103,12 @@ async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> A
         return Err((
             StatusCode::BAD_REQUEST,
             "manual uploads cannot control the lab gateway".into(),
+        ));
+    }
+    if i.source_ip.as_deref() != Some("attacker-lab") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only the fixed lab source can be blocked".into(),
         ));
     }
     if i.response.is_some() {

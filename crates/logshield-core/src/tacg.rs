@@ -400,12 +400,28 @@ fn evaluate_cluster(
     let distributed = cross >= 1.0;
     let is_rotating_sources = sources.len() >= 3 && path_failures >= 4;
 
-    let distinct_failed_users: HashSet<&str> = group
+    // A completed login shortly after a typo is positive evidence of ordinary
+    // user behaviour, even when a trusted historical baseline is not yet built.
+    // Match by account and observed source; an unrelated success cannot clear a probe.
+    let unresolved_failures: Vec<_> = group
         .iter()
         .filter(|e| e.event_type == EventType::FailedLogin)
+        .filter(|failure| {
+            !group.iter().any(|success| {
+                success.event_type == EventType::SuccessfulLogin
+                    && success.username.is_some()
+                    && success.username == failure.username
+                    && success.source_ip == failure.source_ip
+                    && success.timestamp >= failure.timestamp
+                    && (success.timestamp - failure.timestamp).num_seconds() <= 120
+            })
+        })
+        .collect();
+    let distinct_failed_users: HashSet<&str> = unresolved_failures
+        .iter()
         .filter_map(|e| e.username.as_deref())
         .collect();
-    let spray = distinct_failed_users.len() >= 6 && failures >= 6;
+    let spray = distinct_failed_users.len() >= 6 && unresolved_failures.len() >= 6;
 
     let familiar_auth = if config.baseline_familiarity {
         is_familiar_auth(group, baseline)
@@ -415,11 +431,7 @@ fn evaluate_cluster(
 
     // If a password spray is identified, connect consecutive failures from the same source
     if config.graph_edges && spray && !familiar_auth {
-        let failure_events: Vec<_> = group
-            .iter()
-            .filter(|e| e.event_type == EventType::FailedLogin)
-            .collect();
-        for pair in failure_events.windows(2) {
+        for pair in unresolved_failures.windows(2) {
             let a = pair[0];
             let b = pair[1];
             let temporal = temporal_cfg(a, b, config);
@@ -1111,6 +1123,31 @@ mod tests {
         assert!(!incidents.is_empty(), "Password spray must be detected");
         assert_eq!(incidents[0].kind, "PASSWORD SPRAY ATTACK");
         assert!(incidents[0].risk >= 70);
+    }
+    #[test]
+    fn shared_nat_typoes_with_completed_logins_are_not_spraying() {
+        for users in 6..=20 {
+            for spacing in [0, 3, 17] {
+                let mut events = Vec::new();
+                for i in 0..users {
+                    let second = (i * spacing) as i64;
+                    let host = ["infra-a", "infra-b", "infra-c"][i as usize % 3];
+                    let mut failure =
+                        auth_event(EventType::FailedLogin, second, "office-nat", host);
+                    failure.username = Some(format!("employee-{i}"));
+                    let mut success =
+                        auth_event(EventType::SuccessfulLogin, second + 8, "office-nat", host);
+                    success.username = failure.username.clone();
+                    events.extend([failure, success]);
+                }
+                assert!(
+                    correlate(&events, &Baseline::default())
+                        .iter()
+                        .all(|i| i.kind != "PASSWORD SPRAY ATTACK"),
+                    "{users} coworkers with {spacing}s spacing must not be classified as a spray"
+                );
+            }
+        }
     }
     #[test]
     fn temporal_decay_distinguishes_rapid_burst_from_slow_drift() {

@@ -14,7 +14,7 @@ Status: **INTEGRATION BETA** for private, self-hosted evaluation. Do not expose 
 | Event integrity | PARTIALLY IMPLEMENTED | IDs deduplicate; no signed source assertions or tamper-evident evidence. |
 | Crash recovery | PARTIALLY IMPLEMENTED | SDK queue restart tests; response recovery unverified. |
 | SDK and agent reliability | PARTIALLY IMPLEMENTED | Queue retry tests; file rotation and disk-full coverage incomplete. |
-| Detector correctness | PARTIALLY IMPLEMENTED | Unit tests and authored synthetic cases; no independent labeled log corpus. |
+| Detector correctness | PARTIALLY IMPLEMENTED | Unit tests include 6–20 shared-NAT users and authored attack cases; no independent labeled log corpus. |
 | False-positive safety | PARTIALLY IMPLEMENTED | Non-lab automatic containment disabled; field FPR unknown. |
 | Response authorization | PARTIALLY IMPLEMENTED | Lab response protected by operator token; no separate response role. |
 | Deployment security | BLOCKED | No tested hardened non-lab Compose/TLS deployment. |
@@ -26,4 +26,6 @@ Status: **INTEGRATION BETA** for private, self-hosted evaluation. Do not expose 
 | Incident investigation | PARTIALLY IMPLEMENTED | Evidence and graph available; retention/access audit open. |
 | Recovery and rollback | NOT IMPLEMENTED | Response enum exists, gateway lease rollback and restart recovery untested. |
 
-The new snapshot, quarantine and response-state library APIs are not yet an operational promotion or response workflow. The 35/35 synthetic result is a regression measurement and must not be used as a production accuracy claim. A production designation requires a tested private deployment, external security review, backup/restore drill, traffic-derived evaluation, and a load test at the intended operating rate.
+Private API baseline candidates are now stored transactionally with authenticated agent successes. After three distinct incident-free observations, an hour of quarantine, and a ten-minute event cutoff, an operator may attest that one candidate is benign through `POST /api/baseline/approve` using the operator token and `reviewed_benign: true`. The versioned snapshot survives restart. Application-reported source addresses remain unverified; operators must independently review a candidate before approval. Late discovery of a compromised approved account is not automatically rolled back.
+
+The 35/35 synthetic result is a regression measurement and must not be used as a production accuracy claim. A production designation requires a tested private deployment, external security review, backup/restore drill, traffic-derived evaluation, and a load test at the intended operating rate.

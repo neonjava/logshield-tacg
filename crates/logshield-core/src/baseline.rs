@@ -266,6 +266,49 @@ impl Baseline {
         promoted_count
     }
 
+    /// Promote only the candidate explicitly reviewed by an operator. Observation
+    /// counts and elapsed quarantine are prerequisites, never authorization.
+    pub fn approve_quarantined(
+        &mut self,
+        user: &str,
+        ip: &str,
+        host: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.frozen {
+            return false;
+        }
+        if self
+            .users
+            .get(user)
+            .is_some_and(|profile| profile.source_ips.contains(ip) && profile.hosts.contains(host))
+        {
+            return false;
+        }
+        let Some(q) = self.quarantined.get_mut(user) else {
+            return false;
+        };
+        let ready = |candidate: Option<&(DateTime<Utc>, usize)>| {
+            candidate.is_some_and(|(first, count)| {
+                *count >= self.min_quarantine_observations
+                    && (now - *first).num_seconds() >= self.quarantine_seconds
+            })
+        };
+        if !ready(q.candidate_source_ips.get(ip)) || !ready(q.candidate_hosts.get(host)) {
+            return false;
+        }
+        q.candidate_source_ips.remove(ip);
+        q.candidate_hosts.remove(host);
+        let profile = self.users.entry(user.to_owned()).or_default();
+        profile.source_ips.insert(ip.to_owned());
+        profile.hosts.insert(host.to_owned());
+        profile.successful_logins = profile
+            .successful_logins
+            .max(self.min_quarantine_observations);
+        self.version += 1;
+        true
+    }
+
     pub fn deviation(&self, events: &[SecurityEvent]) -> f64 {
         if events.is_empty() {
             return 0.0;

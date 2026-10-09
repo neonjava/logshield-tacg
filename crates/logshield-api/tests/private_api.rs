@@ -148,6 +148,39 @@ async fn private_mode_auth_ingest_and_restart() {
     );
     assert_eq!(websocket_status(port, None).await, 401);
     assert_eq!(websocket_status(port, Some(&operator)).await, 101);
+    let candidate = json!({"username":"alice","source_ip":"192.0.2.9","hostname":"private-app","reviewed_benign":true});
+    assert_eq!(
+        client
+            .post(format!("{base}/api/baseline/approve"))
+            .json(&candidate)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/api/baseline/approve"))
+            .bearer_auth("private-test-viewer-token-32chars")
+            .json(&candidate)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/api/baseline/approve"))
+            .bearer_auth(&operator)
+            .json(&candidate)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
     assert_eq!(
         websocket_status(port, Some("private-test-viewer-token-32chars")).await,
         101
