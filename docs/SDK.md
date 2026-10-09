@@ -53,7 +53,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The same source is available as a compilable [example](../crates/logshield-ingest/examples/send_event.rs). With the local API and a registered source running, set `LOGSHIELD_URL=http://127.0.0.1:3000` and `LOGSHIELD_TOKEN` in your terminal, then run `cargo run -p logshield-ingest --example send_event`.
 
-The API accepts **1–100 events per request**, within a **1 MiB request body**. `send` returns an `IngestReceipt` with `queued`, `source`, and `durable`. `durable=true` means the event and incident evidence writes completed in SQLite before the HTTP response. The SDK uses a 15-second request timeout. Keep stable event IDs on retry so SQLite can deduplicate accepted records. `heartbeat()` updates the source's last-seen time. The SDK surfaces HTTP failures through `reqwest::Error`; direct SDK users must supply their own retry queue if they need offline durability.
+The API accepts **1–100 events per request**, within a **1 MiB request body**. `send` returns an `IngestReceipt` with `queued`, `source`, and `durable`. `durable=true` means the event and incident evidence writes completed in SQLite before the HTTP response. The SDK uses a 15-second request timeout. Keep stable event IDs on retry so SQLite can deduplicate accepted records. `heartbeat()` updates the source's last-seen time. The SDK surfaces HTTP failures through `reqwest::Error`.
+
+### Optional disk-backed delivery
+
+Applications that need to survive a temporary API outage can opt into `DurableIngestQueue`:
+
+```rust
+use logshield_ingest::{DurableIngestQueue, IngestClient};
+
+let queue = DurableIngestQueue::new(
+    IngestClient::new(endpoint, token),
+    "/var/lib/my-app/logshield-spool",
+    1_000, // maximum pending batches; each batch holds 1–100 events
+)?;
+queue.enqueue(&events).await?; // file is synced before this returns
+// Call flush periodically, and after connectivity returns.
+queue.flush().await?;
+```
+
+The queue uses a private directory and private files on Unix, writes each batch with a temporary file and atomic rename, and delivers oldest batches first. It removes a file only after the API confirms `durable:true`. An HTTP timeout can occur after the API commits a batch; stable event IDs make replay idempotent. If the queue is full, `enqueue` fails instead of dropping evidence. Keep the spool directory on durable storage and use **one queue owner per directory**. A corrupt queued file stops flushing for operator repair; there is no automatic corruption recovery, cross-process locking, or built-in background retry scheduler. Call `flush` from your own bounded worker.
 
 ## File agent
 

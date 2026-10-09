@@ -11,3 +11,5 @@ Run `cargo test -p logshield-core --test evaluation -- --nocapture`. This determ
 The central counter sees the same five failures in the distributed and benign cases. TACG requires a connected same-account failure path and lowers automatic-response risk when the source and hosts are established in the baseline. The ordered multi-stage case is detected without five failures.
 
 **These figures are only fixture checks, not measured real-world precision, recall, or false-positive rate.** The examples were constructed to expose these rules, contain no natural background traffic, and use trusted lab source labels. A representative labeled log corpus, independent ground truth, multiple organizations, and sustained ingestion load tests are required before production claims. The `confidence` API field is an evidence-strength score, not a calibrated probability.
+
+The separate [local ingestion probe](PERFORMANCE.md) measures delivery and processing of synthetic benign events. It does not measure attack detection quality.
