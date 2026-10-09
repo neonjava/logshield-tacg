@@ -14,3 +14,23 @@ Prepare once: run the release build, `docker compose build`, `docker compose up 
 | 1:50–2:00 | “The whole monitoring and response pipeline is native Rust. This proves cross-host detection and measured containment in our isolated local lab.” |
 
 Optional judge follow-up: clear lab data, enable **Force response failure**, rerun distributed auth and show gateway HTTP 503, client HTTP 401, and `RESPONSE_FAILED` with human intervention required.
+
+## Hands-on three-app showcase
+
+Open **Lab** and use the three sample-app links, or open `http://127.0.0.1:5173/lab/app-a`, `/lab/app-b`, and `/lab/app-c` in separate tabs. These are client views for the fixed Docker services. Choose `attacker-lab` as the source and enter any incorrect password. Each click sends a real request through the Rust client and gateway to that app; the app writes a JSON log, and the Rust sensor reads it. The page displays the actual gateway HTTP status. The only valid dummy password is `hackathon123`.
+
+For a terminal presentation, run these fixed-target commands from the host. No arbitrary URL or external destination is accepted:
+
+```bash
+cd /home/neonjava/logshield
+curl -sS -X POST http://127.0.0.1:3000/api/lab/clear
+for app in app-a app-a app-b app-b app-c; do
+  curl -sS -X POST http://127.0.0.1:3000/api/lab/attempt \
+    -H 'Content-Type: application/json' \
+    -d "{\"app\":\"$app\",\"operation\":\"login\",\"source\":\"attacker-lab\",\"password\":\"wrong\"}"
+  echo
+  sleep 1
+done
+```
+
+Then open **Events** and **Incidents**. Each host has fewer than five failures; TACG correlates all three hosts. The fifth request creates the incident. The automatic verification retry receives HTTP 403, after which the incident becomes `CONTAINED`. To show a multi-stage sequence, clear lab data and use **Start multi-stage test** in Lab; it sends two failures, a valid dummy login, a safe lab admin operation, and a local outbound-style request through the same path.

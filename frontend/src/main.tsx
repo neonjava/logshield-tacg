@@ -1033,6 +1033,34 @@ function App() {
                 </pre>
               )}
             </section>
+            <section className="panel sample-services">
+              <div className="panel-head">
+                <div>
+                  <span className="eyebrow">LIVE APPLICATIONS</span>
+                  <h2>Open the three sample apps</h2>
+                </div>
+                <span className="panel-meta">FIXED LOCAL TARGETS</span>
+              </div>
+              <div className="sample-links">
+                {(["app-a", "app-b", "app-c"] as const).map((app) => (
+                  <a
+                    key={app}
+                    href={`/lab/${app}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    <Server size={19} />
+                    <span>{app.toUpperCase()}</span>
+                    <small>Open local login page ↗</small>
+                  </a>
+                ))}
+              </div>
+              <p className="sample-note">
+                Each request travels through the lab client and gateway before
+                the app writes its log. Use the same source on all three pages
+                to demonstrate cross-host correlation.
+              </p>
+            </section>
             <section className="panel">
               <div className="panel-head">
                 <div>
@@ -1144,4 +1172,102 @@ function IncidentRow({ i, onClick }: { i: Incident; onClick: () => void }) {
     </button>
   );
 }
-createRoot(document.getElementById("root")!).render(<App />);
+const sampleApp = /^\/lab\/(app-[abc])$/.exec(location.pathname)?.[1];
+function SampleApp({ app }: { app: string }) {
+  const [password, setPassword] = useState("");
+  const [source, setSource] = useState("attacker-lab");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  const send = async (operation: string) => {
+    setBusy(true);
+    try {
+      const response = await api("/lab/attempt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ app, operation, source, password }),
+      });
+      setResult(response);
+    } catch (error) {
+      setResult({ error: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const names: Record<string, string> = {
+    "app-a": "Operations Portal",
+    "app-b": "Support Console",
+    "app-c": "Inventory Admin",
+  };
+  return (
+    <main className="sample-page">
+      <div className="sample-top">
+        <strong>LOGSHIELD / CONTROLLED LAB</strong>
+        <a href="/">Open SOC dashboard ↗</a>
+      </div>
+      <div className="sample-card">
+        <div className="sample-icon">
+          <Server size={26} />
+        </div>
+        <span className="eyebrow">
+          {app.toUpperCase()} · LOCAL TEST SERVICE
+        </span>
+        <h1>{names[app]}</h1>
+        <p>
+          Send a real login request through the Rust gateway. The application
+          writes a log that LogShield will read.
+        </p>
+        <label>
+          Username
+          <input value="demo" readOnly />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Enter a test password"
+            maxLength={128}
+          />
+        </label>
+        <label>
+          Lab source
+          <select value={source} onChange={(e) => setSource(e.target.value)}>
+            <option value="attacker-lab">attacker-lab</option>
+            <option value="normal-client">normal-client</option>
+          </select>
+        </label>
+        <button
+          className="sample-submit"
+          onClick={() => send("login")}
+          disabled={busy}
+        >
+          Send login request
+        </button>
+        <div className="sample-ops">
+          <button onClick={() => send("lab/admin-operation")} disabled={busy}>
+            Lab admin operation
+          </button>
+          <button onClick={() => send("lab/outbound")} disabled={busy}>
+            Local outbound-style request
+          </button>
+        </div>
+        {result && (
+          <div className="sample-result">
+            <strong>
+              ACTUAL GATEWAY RESULT · HTTP {result.attempt?.status ?? "ERROR"}
+            </strong>
+            <pre>{JSON.stringify(result, null, 2)}</pre>
+          </div>
+        )}
+        <p className="sample-safety">
+          ISOLATED LOCAL SECURITY LAB · Fixed Docker targets only. No external
+          systems are contacted.
+        </p>
+      </div>
+    </main>
+  );
+}
+createRoot(document.getElementById("root")!).render(
+  sampleApp ? <SampleApp app={sampleApp} /> : <App />,
+);
