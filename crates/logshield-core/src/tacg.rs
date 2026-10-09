@@ -66,6 +66,95 @@ fn suspicious(t: EventType) -> bool {
             | EventType::UnauthorizedAccess
     )
 }
+/// Link consecutive failures for each account. A distributed detection must
+/// span one connected path, rather than merely share a source counter.
+fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64) {
+    let mut previous: HashMap<&str, &SecurityEvent> = HashMap::new();
+    let mut edges = Vec::new();
+    let mut longest_hosts = 0;
+    let mut longest_failures = 0;
+    let mut best_cross = 0.0;
+    let mut paths: HashMap<&str, (usize, HashSet<&str>)> = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|e| e.event_type == EventType::FailedLogin)
+    {
+        let Some(user) = event.username.as_deref() else {
+            continue;
+        };
+        let Some(host) = event.hostname.as_deref() else {
+            continue;
+        };
+        let prior = previous.insert(user, event);
+        let connected = prior.is_some_and(|old| temporal_strength(old, event) >= 0.35);
+        let path = paths.entry(user).or_insert_with(|| (0, HashSet::new()));
+        if !connected {
+            *path = (0, HashSet::new());
+        }
+        path.0 += 1;
+        path.1.insert(host);
+        if let Some(old) = prior.filter(|_| connected) {
+            let (entity, _) = entity_strength(old, event);
+            edges.push(GraphEdge {
+                from: old.id,
+                to: event.id,
+                strength: (0.6 * temporal_strength(old, event) + 0.4 * entity).min(1.0),
+                reasons: vec![
+                    "same source".into(),
+                    "same username".into(),
+                    "time-decayed authentication path".into(),
+                ],
+            });
+        }
+        let cross = if path.1.len() >= 3 && path.0 >= 5 {
+            1.0
+        } else if path.1.len() >= 2 && path.0 >= 4 {
+            0.7
+        } else {
+            0.0
+        };
+        if cross > best_cross || (cross == best_cross && path.0 > longest_failures) {
+            best_cross = cross;
+            longest_failures = path.0;
+            longest_hosts = path.1.len();
+        }
+    }
+    (edges, longest_failures, longest_hosts, best_cross)
+}
+
+fn ordered_attack_chain(events: &[SecurityEvent]) -> bool {
+    events
+        .iter()
+        .filter(|e| e.event_type == EventType::SuccessfulLogin)
+        .any(|login| {
+            let Some(user) = login.username.as_deref() else {
+                return false;
+            };
+            let failures = events
+                .iter()
+                .filter(|e| {
+                    e.event_type == EventType::FailedLogin
+                        && e.username.as_deref() == Some(user)
+                        && e.timestamp < login.timestamp
+                })
+                .count();
+            failures >= 2
+                && events
+                    .iter()
+                    .filter(|e| {
+                        e.event_type == EventType::PrivilegeAction
+                            && e.username.as_deref() == Some(user)
+                            && e.timestamp > login.timestamp
+                    })
+                    .any(|privilege| {
+                        events.iter().any(|outbound| {
+                            outbound.event_type == EventType::UnusualNetworkActivity
+                                && outbound.timestamp > privilege.timestamp
+                                && outbound.username.as_deref().is_none_or(|name| name == user)
+                        })
+                    })
+        })
+}
 pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident> {
     let mut sorted: Vec<_> = events
         .iter()
@@ -113,13 +202,7 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 .filter(|e| e.event_type == EventType::FailedLogin)
                 .filter_map(|e| e.hostname.as_ref())
                 .collect();
-            let cross = if hosts.len() >= 3 && failures >= 5 {
-                1.0
-            } else if hosts.len() >= 2 && failures >= 4 {
-                0.7
-            } else {
-                0.0
-            };
+            let (failure_edges, path_failures, path_hosts, cross) = failure_paths(&group);
             let mut edges = Vec::new();
             let mut temporal_total = 0.0;
             let mut entity_total = 0.0;
@@ -147,16 +230,32 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                 transition_total += tr;
                 count += 1.0;
             }
+            for edge in failure_edges {
+                if !edges
+                    .iter()
+                    .any(|existing| existing.from == edge.from && existing.to == edge.to)
+                {
+                    edges.push(edge);
+                }
+            }
             let types: HashSet<_> = group
                 .iter()
                 .map(|e| std::mem::discriminant(&e.event_type))
                 .collect();
             let has = |t: EventType| group.iter().any(|e| e.event_type == t);
-            let full_chain = failures >= 2
-                && has(EventType::SuccessfulLogin)
-                && has(EventType::PrivilegeAction)
-                && has(EventType::UnusualNetworkActivity);
-            let brute = failures >= 6;
+            let full_chain = ordered_attack_chain(&group);
+            let mut per_account_host: HashMap<(&str, &str), usize> = HashMap::new();
+            for event in group
+                .iter()
+                .filter(|e| e.event_type == EventType::FailedLogin)
+            {
+                if let (Some(user), Some(host)) =
+                    (event.username.as_deref(), event.hostname.as_deref())
+                {
+                    *per_account_host.entry((user, host)).or_default() += 1;
+                }
+            }
+            let brute = per_account_host.values().any(|count| *count >= 6);
             let distributed = cross >= 1.0;
             let repeated_mfa = group
                 .iter()
@@ -208,6 +307,22 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
                     .collect();
                 previous.len() >= 3 && !previous.iter().any(|old| old.source_ip == e.source_ip)
             });
+            let familiar_auth = distributed
+                && group
+                    .iter()
+                    .filter(|e| e.event_type == EventType::FailedLogin)
+                    .all(|e| {
+                        e.username
+                            .as_deref()
+                            .and_then(|user| baseline.users.get(user))
+                            .is_some_and(|profile| {
+                                profile.successful_logins >= 3
+                                    && profile.source_ips.contains(&source)
+                                    && e.hostname
+                                        .as_ref()
+                                        .is_some_and(|host| profile.hosts.contains(host))
+                            })
+                    });
             if !(brute
                 || distributed
                 || full_chain
@@ -218,7 +333,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             {
                 continue;
             }
-            let rarity = if full_chain {
+            let rarity = if familiar_auth {
+                0.3
+            } else if full_chain {
                 1.0
             } else if success_after_failures || repeated_mfa {
                 0.9
@@ -241,7 +358,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             } else {
                 0.0
             };
-            let transition_score = if full_chain || success_after_failures {
+            let transition_score = if familiar_auth {
+                0.35
+            } else if full_chain || success_after_failures {
                 1.0
             } else if repeated_mfa {
                 0.9
@@ -254,7 +373,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             } else {
                 transition_total / count.max(1.0)
             };
-            let behaviour = baseline.deviation(&group).max(if full_chain {
+            let behaviour = baseline.deviation(&group).max(if familiar_auth {
+                0.0
+            } else if full_chain {
                 0.8
             } else if success_after_failures || repeated_mfa {
                 0.75
@@ -267,7 +388,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             } else {
                 0.3
             });
-            let bonus = if full_chain {
+            let bonus = if familiar_auth {
+                0.0
+            } else if full_chain {
                 25.0
             } else if success_after_failures {
                 20.0
@@ -298,6 +421,9 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             if hosts.len() > 1 {
                 reasons.push(format!("same source across {} hosts", hosts.len()));
             }
+            if distributed {
+                reasons.push(format!("connected failure path: {path_failures} attempts across {path_hosts} hosts for one account"));
+            }
             if full_chain {
                 reasons.push("ordered authentication → privilege → outbound attack chain".into());
             }
@@ -323,7 +449,11 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             if types.len() > 3 {
                 reasons.push("multiple security event types linked".into());
             }
-            reasons.push("behavior differs from learned normal activity".into());
+            if familiar_auth {
+                reasons.push("known account, source, and hosts; review before containment".into());
+            } else {
+                reasons.push("behavior differs from learned normal activity".into());
+            }
             let severity = RiskLevel::from_score(score.final_risk);
             let target = group
                 .iter()
@@ -412,6 +542,62 @@ mod tests {
         assert_eq!(i.len(), 1);
         assert!(i[0].risk >= 70);
         assert_eq!(i[0].events.len(), 5);
+    }
+    #[test]
+    fn central_counter_is_insufficient_without_account_path() {
+        let mut events = scenario("distributed");
+        for (index, event) in events.iter_mut().enumerate() {
+            event.username = Some(format!("user-{index}"));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == EventType::FailedLogin)
+                .count(),
+            5
+        );
+        assert!(correlate(&events, &Baseline::default()).is_empty());
+    }
+    #[test]
+    fn distant_failures_do_not_form_distributed_path() {
+        let mut events = scenario("distributed");
+        let first = events[0].timestamp;
+        for (index, event) in events.iter_mut().enumerate() {
+            event.timestamp = first + chrono::Duration::seconds(index as i64 * 120);
+        }
+        assert!(correlate(&events, &Baseline::default()).is_empty());
+    }
+    #[test]
+    fn familiar_account_path_alerts_without_automatic_block() {
+        let failures = scenario("distributed");
+        let source = failures[0].source_ip.as_deref().unwrap();
+        let mut normal = Vec::new();
+        for (index, host) in ["server-a", "server-b", "server-c"].iter().enumerate() {
+            normal.push(auth_event(
+                EventType::SuccessfulLogin,
+                index as i64,
+                source,
+                host,
+            ));
+            normal.last_mut().unwrap().username = Some("admin".into());
+        }
+        let incident = correlate(&failures, &Baseline::learn(&normal)).remove(0);
+        assert_eq!(incident.kind, "DISTRIBUTED AUTHENTICATION ATTACK");
+        assert!(incident.risk < crate::response::RESPONSE_RISK_THRESHOLD);
+    }
+    #[test]
+    fn reordered_stages_are_not_a_multi_stage_attack() {
+        let mut events = scenario("multistage");
+        let outbound = events
+            .iter()
+            .position(|e| e.event_type == EventType::UnusualNetworkActivity)
+            .unwrap();
+        events[outbound].timestamp = events[0].timestamp - chrono::Duration::seconds(1);
+        assert!(
+            correlate(&events, &Baseline::default())
+                .iter()
+                .all(|incident| incident.kind != "MULTI-STAGE INTRUSION")
+        );
     }
     #[test]
     fn multistage_is_critical() {

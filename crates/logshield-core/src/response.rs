@@ -22,7 +22,7 @@ pub fn begin(incident: &mut Incident) {
             timestamp: Utc::now(),
             stage: "ACTION_REQUESTED".into(),
             detail: format!(
-                "Risk {} >= {} and confidence {} >= {}",
+                "Risk {} >= {} and evidence strength {} >= {} (rule score, not calibrated probability)",
                 incident.risk,
                 RESPONSE_RISK_THRESHOLD,
                 incident.confidence,

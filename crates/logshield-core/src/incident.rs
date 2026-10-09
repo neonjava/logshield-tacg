@@ -37,6 +37,8 @@ pub struct Incident {
     pub risk: u8,
     pub severity: RiskLevel,
     pub status: IncidentStatus,
+    /// Rule-based evidence strength (0-100), not a calibrated probability.
+    /// Field name is retained for stored incident/API compatibility.
     pub confidence: u8,
     pub score: ScoreBreakdown,
     pub reasons: Vec<String>,

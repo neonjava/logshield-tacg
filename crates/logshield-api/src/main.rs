@@ -44,6 +44,7 @@ struct AppState {
     tx: mpsc::Sender<Vec<SecurityEvent>>,
     broadcast: broadcast::Sender<String>,
     processing: Arc<Mutex<()>>,
+    reset_at: Arc<Mutex<Option<chrono::DateTime<Utc>>>>,
     client: reqwest::Client,
     gateway: String,
     attacker: String,
@@ -69,6 +70,7 @@ async fn main() {
         tx,
         broadcast,
         processing: Arc::new(Mutex::new(())),
+        reset_at: Arc::new(Mutex::new(None)),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -144,8 +146,17 @@ async fn main() {
 async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
     while let Some(batch) = rx.recv().await {
         let _guard = state.processing.lock().await;
+        let reset_at = *state.reset_at.lock().await;
         let mut inserted = false;
         for e in &batch {
+            if reset_at.is_some_and(|cutoff| {
+                e.timestamp <= cutoff
+                    && e.origin.as_deref().is_some_and(|origin| {
+                        origin == "lab_sensor" || origin.starts_with("agent:")
+                    })
+            }) {
+                continue;
+            }
             match db::insert_event(&state.db, e).await {
                 Ok(true) => {
                     inserted = true;
@@ -1077,6 +1088,7 @@ async fn clear_lab(State(s): State<AppState>) -> ApiResult<Value> {
         return Err((StatusCode::BAD_GATEWAY, "gateway reset failed".into()));
     }
     sensor::skip_existing(&s.log_dir, &s.offsets).await;
+    *s.reset_at.lock().await = Some(Utc::now());
     db::clear(&s.db).await.map_err(internal)?;
     let _ = s
         .broadcast

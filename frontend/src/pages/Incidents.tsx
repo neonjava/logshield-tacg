@@ -103,9 +103,9 @@ export function Incidents({
           <Badge value={incident.severity} />
         </div>
         <div>
-          <span>Detection confidence</span>
-          <strong>{incident.confidence}%</strong>
-          <small>Based on linked evidence</small>
+          <span>Evidence strength</span>
+          <strong>{incident.confidence}<small>/100</small></strong>
+          <small>Rule score; not a probability</small>
         </div>
         <div>
           <span>Source</span>
