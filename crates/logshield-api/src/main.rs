@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -44,6 +44,8 @@ struct AppState {
     tx: mpsc::Sender<Vec<SecurityEvent>>,
     broadcast: broadcast::Sender<String>,
     processing: Arc<Mutex<()>>,
+    response_gate: Arc<Mutex<()>>,
+    reset_generation: Arc<AtomicU64>,
     reset_at: Arc<Mutex<Option<chrono::DateTime<Utc>>>>,
     client: reqwest::Client,
     gateway: String,
@@ -70,6 +72,8 @@ async fn main() {
         tx,
         broadcast,
         processing: Arc::new(Mutex::new(())),
+        response_gate: Arc::new(Mutex::new(())),
+        reset_generation: Arc::new(AtomicU64::new(0)),
         reset_at: Arc::new(Mutex::new(None)),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -205,14 +209,19 @@ async fn worker(state: AppState, mut rx: mpsc::Receiver<Vec<SecurityEvent>>) {
             if new.status == IncidentStatus::PendingVerification {
                 let state = state.clone();
                 let id = new.id.to_string();
+                let generation = state.reset_generation.load(Ordering::SeqCst);
                 tokio::spawn(async move {
-                    execute_response(state, id).await;
+                    execute_response(state, id, generation).await;
                 });
             }
         }
     }
 }
-async fn execute_response(state: AppState, id: String) {
+async fn execute_response(state: AppState, id: String, generation: u64) {
+    let _guard = state.response_gate.lock().await;
+    if state.reset_generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
     let Some(mut incident) = db::incident(&state.db, &id).await.ok().flatten() else {
         return;
     };
@@ -917,8 +926,9 @@ async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> A
     response::begin(&mut i);
     db::save_incident(&s.db, &i).await.map_err(internal)?;
     let state = s.clone();
+    let generation = state.reset_generation.load(Ordering::SeqCst);
     tokio::spawn(async move {
-        execute_response(state, id).await;
+        execute_response(state, id, generation).await;
     });
     Ok(Json(i))
 }
@@ -1078,6 +1088,8 @@ async fn clear_lab(State(s): State<AppState>) -> ApiResult<Value> {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "lab disabled".into()));
     }
     let _guard = s.processing.lock().await;
+    let _response_guard = s.response_gate.lock().await;
+    s.reset_generation.fetch_add(1, Ordering::SeqCst);
     let r = s
         .client
         .post(format!("{}/internal/reset", s.gateway))
