@@ -1,5 +1,7 @@
 # LogShield TACG
 
+**Remote showcase and local fallback:** see [docs/REMOTE_DEMO.md](docs/REMOTE_DEMO.md). The VPS demonstration uses three Rust replicas, authenticated log agents, real gateway requests, and a dashboard reachable through an SSH tunnel; the same demo works locally if the VPS is unavailable.
+
 **AI26CY03 — Log-Based Intrusion Detection**
 
 LogShield TACG is a defensive security-monitoring project. It collects system, application, authentication, and gateway logs; connects related events across time and servers; shows the evidence behind an incident; and verifies a local defensive response. Its detection engine and backend are written in Rust. The React dashboard displays results and offers controlled demonstration tools.
