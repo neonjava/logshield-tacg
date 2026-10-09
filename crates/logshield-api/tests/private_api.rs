@@ -44,7 +44,7 @@ impl Server {
             )
             .env(
                 "LOGSHIELD_INGEST_TOKENS",
-                format!(r#"{{"private-app":"{source}"}}"#),
+                json!({"private-app":source,"agent-b":format!("{source}b"),"agent-c":format!("{source}c"),"agent-d":format!("{source}d")}).to_string(),
             )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -520,6 +520,96 @@ async fn synthetic_private_ingest_throughput() {
         persisted as f64 / seconds,
         latencies[24],
         latencies[47],
+    );
+    pool.close().await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "manual 4-agent mixed-traffic probe; use --ignored --nocapture"]
+async fn concurrent_mixed_ingest_probe() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let directory = std::env::temp_dir().join(format!("logshield-mixed-load-{}", Uuid::new_v4()));
+    let _cleanup = TestDir(directory.clone());
+    let operator = Uuid::new_v4().simple().to_string();
+    let source = Uuid::new_v4().simple().to_string();
+    let base = format!("http://127.0.0.1:{port}");
+    let server = Server::start(port, directory.clone(), &operator, &source);
+    ready(&Client::new(), &base).await;
+    let start = std::time::Instant::now();
+    let mut producers = Vec::new();
+    for agent in 0..4 {
+        let token = if agent == 0 {
+            source.clone()
+        } else {
+            format!("{source}{}", ["", "b", "c", "d"][agent])
+        };
+        let endpoint = base.clone();
+        producers.push(tokio::spawn(async move {
+            let sdk = IngestClient::new(endpoint, token);
+            let mut latencies = Vec::new();
+            for batch_number in 0..5 {
+                let batch: Vec<_> = (0..100)
+                    .map(|i| {
+                        let serial = agent * 500 + batch_number * 100 + i;
+                        let malicious = i % 20 == 0;
+                        let kind = if malicious {
+                            EventType::FailedLogin
+                        } else if i % 13 == 0 {
+                            EventType::SuccessfulLogin
+                        } else {
+                            EventType::WebRequest
+                        };
+                        let mut event = new_event(
+                            kind,
+                            if malicious {
+                                "probe-source"
+                            } else {
+                                "shared-office"
+                            },
+                            "untrusted-app-host",
+                        );
+                        event.username = Some(if malicious {
+                            "victim".into()
+                        } else {
+                            format!("user-{serial}")
+                        });
+                        event.service = Some("portal".into());
+                        event
+                    })
+                    .collect();
+                let sent = std::time::Instant::now();
+                assert!(sdk.send(&batch).await.unwrap().durable);
+                latencies.push(sent.elapsed().as_secs_f64() * 1000.0);
+            }
+            latencies
+        }));
+    }
+    let mut latencies = Vec::new();
+    for producer in producers {
+        latencies.extend(producer.await.unwrap());
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    latencies.sort_by(f64::total_cmp);
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        directory.join("events.db").display()
+    ))
+    .await
+    .unwrap();
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(persisted, 2_000);
+    println!(
+        "4-agent mixed localhost probe: {persisted} events in {seconds:.2}s ({:.0} events/s), batch p50 {:.1}ms p95 {:.1}ms p99 {:.1}ms; synthetic mixed/high-cardinality traffic, one API process",
+        persisted as f64 / seconds,
+        latencies[9],
+        latencies[18],
+        latencies[19]
     );
     pool.close().await;
     drop(server);

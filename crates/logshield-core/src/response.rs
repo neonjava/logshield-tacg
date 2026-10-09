@@ -33,6 +33,24 @@ pub fn request_approval(incident: &mut Incident) {
 }
 
 pub fn begin(incident: &mut Incident) {
+    let mut prior_proof = incident
+        .response
+        .take()
+        .filter(|record| record.state == Some(ResponseState::AwaitingApproval))
+        .map(|record| record.proof)
+        .unwrap_or_default();
+    prior_proof.push(ResponseStep {
+        timestamp: Utc::now(),
+        stage: "ACTION_REQUESTED".into(),
+        detail: format!(
+            "Risk {} >= {} and evidence strength {} >= {} (rule score, not calibrated probability)",
+            incident.risk,
+            RESPONSE_RISK_THRESHOLD,
+            incident.confidence,
+            RESPONSE_CONFIDENCE_THRESHOLD
+        ),
+        http_status: None,
+    });
     incident.response = Some(ResponseRecord {
         actions: vec!["Request 60-second source block at the lab gateway".into()],
         responded_at: Utc::now(),
@@ -40,18 +58,7 @@ pub fn begin(incident: &mut Incident) {
         result: "Gateway action requested; waiting for real HTTP verification".into(),
         response_confidence: incident.confidence,
         evidence: incident.events.iter().map(|e| e.id).collect(),
-        proof: vec![ResponseStep {
-            timestamp: Utc::now(),
-            stage: "ACTION_REQUESTED".into(),
-            detail: format!(
-                "Risk {} >= {} and evidence strength {} >= {} (rule score, not calibrated probability)",
-                incident.risk,
-                RESPONSE_RISK_THRESHOLD,
-                incident.confidence,
-                RESPONSE_CONFIDENCE_THRESHOLD
-            ),
-            http_status: None,
-        }],
+        proof: prior_proof,
         state: Some(ResponseState::ResponseRequested),
     });
     incident.status = IncidentStatus::PendingVerification;
@@ -172,6 +179,10 @@ mod tests {
         );
 
         begin(&mut i);
+        assert_eq!(
+            i.response.as_ref().unwrap().proof[0].stage,
+            "AWAITING_APPROVAL"
+        );
         assert_eq!(i.status, IncidentStatus::PendingVerification);
         assert_eq!(
             i.response.as_ref().unwrap().state,
@@ -220,6 +231,17 @@ mod tests {
         assert_eq!(
             i.response.as_ref().unwrap().state,
             Some(ResponseState::RolledBack)
+        );
+    }
+    #[test]
+    fn timeout_cannot_be_reported_as_contained() {
+        let mut incident = correlate(&scenario("multistage"), &Baseline::default()).remove(0);
+        begin(&mut incident);
+        finish(&mut incident, false, 0, false);
+        assert_eq!(incident.status, IncidentStatus::ResponseFailed);
+        assert_eq!(
+            incident.response.unwrap().state,
+            Some(ResponseState::ResponseFailed)
         );
     }
 }

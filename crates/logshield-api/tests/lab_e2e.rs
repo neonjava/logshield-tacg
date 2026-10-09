@@ -115,6 +115,22 @@ async fn real_logs_gateway_containment_and_failure() {
         verification["verification_attempts"][0]["body"]["blocked"],
         true
     );
+    let rolled_back = post(&client, &format!("/incidents/{id}/rollback")).await;
+    assert_eq!(rolled_back["status"], "ROLLED_BACK");
+    assert_eq!(rolled_back["response"]["state"], "ROLLED_BACK");
+    assert_eq!(
+        client
+            .post(format!("{API}/incidents/{id}/rollback"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let retried = client.post(format!("{API}/lab/attempt"))
+        .json(&serde_json::json!({"app":"app-a","operation":"login","source":"attacker-lab","password":"wrong"}))
+        .send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
+    assert_eq!(retried["attempt"]["status"], 401);
     assert!(
         !json(&client, "/events")
             .await
@@ -203,6 +219,40 @@ async fn real_logs_gateway_containment_and_failure() {
     })
     .await;
     assert!(manual_incident[0]["risk"].as_u64().unwrap_or(0) >= 85);
+    let manual_id = manual_incident[0]["id"].as_str().unwrap();
+    client
+        .post(format!("{API}/lab/force-failure"))
+        .json(&serde_json::json!({"enabled":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        client
+            .post(format!("{API}/incidents/{manual_id}/rollback"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        json(&client, &format!("/incidents/{manual_id}")).await["status"],
+        "CONTAINED"
+    );
+    client
+        .post(format!("{API}/lab/force-failure"))
+        .json(&serde_json::json!({"enabled":false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        post(&client, &format!("/incidents/{manual_id}/rollback")).await["status"],
+        "ROLLED_BACK"
+    );
 
     post(&client, "/lab/clear").await;
     let normal_infra = post(&client, "/infra/run/normal").await;
@@ -368,4 +418,28 @@ async fn real_logs_gateway_containment_and_failure() {
         .await
         .unwrap();
     assert_eq!(exported.lines().count(), 3);
+
+    post(&client, "/lab/clear").await;
+    post(&client, "/lab/run/distributed").await;
+    let lease = wait_for(&client, "/incidents", |value| {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["status"] == "CONTAINED"))
+    })
+    .await;
+    let lease_id = lease[0]["id"].as_str().unwrap().to_owned();
+    assert!(
+        Command::new("docker")
+            .args(["compose", "restart", "logshield-api"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = wait_for(&client, "/status", |value| value["database"] == true).await;
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    let expired = wait_for(&client, &format!("/incidents/{lease_id}"), |value| {
+        value["status"] == "EXPIRED"
+    })
+    .await;
+    assert_eq!(expired["response"]["state"], "EXPIRED");
 }

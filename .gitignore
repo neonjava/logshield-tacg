@@ -9,3 +9,5 @@
 /frontend/*.tsbuildinfo
 /lab-logs
 /lab-state
+/deploy/production/secrets/
+/deploy/production/.env

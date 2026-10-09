@@ -1,28 +1,58 @@
 # Private self-hosted deployment
 
-This is the first supported deployment direction for LogShield TACG. It is an integration beta; the Docker Compose stack is an isolated test environment, not a hardened production manifest.
+LogShield remains an **integration beta**. `deploy/production/compose.yml` is a separate non-lab deployment path, tested locally with disposable credentials and a self-signed certificate. It is not a public-internet configuration.
 
-## Trust boundaries
+## Prepare a private Linux host
 
-- Keep `API_BIND` on `127.0.0.1:3000` unless the API is on a private interface behind a firewall or authenticated reverse proxy. Do not publish the API or lab gateway directly to the internet.
-- Set `LAB_MODE=false`. This disables lab traffic controls and automated gateway action. The API refuses to start unless `LOGSHIELD_OPERATOR_TOKEN` is at least 24 characters.
-- Set a distinct, random ingestion token for each source using `LOGSHIELD_INGEST_TOKENS`. Keep source tokens and the operator token in a secret store or restricted environment file; rotate them after exposure.
-- Put TLS and user authentication at a trusted reverse proxy when serving the browser. The proxy must remove any client-supplied `Authorization` header before injecting a **viewer** token for read-only dashboard access. Never inject the operator token into an unaudited browser session. Serve dashboard and API on the same origin; WebSocket upgrades must pass through the proxy. This proxy model remains untested as a complete deployment.
-- Allow health checks to `/api/health` without a token. `/api/ingest/events` and `/api/ingest/heartbeat` require a registered source token. Protected GET and WebSocket routes accept `Authorization: Bearer <viewer or operator token>`; writes require the operator token. Browser WebSockets cannot attach arbitrary bearer headers directly, so use the trusted proxy. Never send tokens in query parameters.
+Install Docker Compose, Rust, Node/npm, OpenSSL, and `htpasswd`. Build the binaries and UI from the repository root:
 
-## Minimal API configuration
-
-```text
-LAB_MODE=false
-API_BIND=127.0.0.1:3000
-DATABASE_URL=sqlite:///restricted/path/logshield.db?mode=rwc
-LOGSHIELD_OPERATOR_TOKEN=<unique random value, at least 24 characters>
-LOGSHIELD_VIEWER_TOKEN=<different random value, at least 24 characters, optional>
-LOGSHIELD_INGEST_TOKENS={"web-1":"<different random value, at least 24 characters>"}
+```bash
+cargo build --release --workspace
+cd frontend && npm ci && npm run build && cd ..
+mkdir -p deploy/production/secrets
+cp deploy/production/.env.example deploy/production/.env
 ```
 
-Create the database directory with restrictive permissions and back it up. Do not place real credentials or log contents in Git. Send an event with a stable event ID; the API returns `durable:true` only after SQLite writes the evidence. An HTTP timeout can still mean the write happened, so retry with the same ID. The file agent saves its offset after this receipt. Direct SDK callers can opt into the [bounded disk-backed queue](SDK.md#optional-disk-backed-delivery) and must schedule its flush worker themselves.
+Set three **different** random tokens in `.env`; `openssl rand -hex 32` generates each. `LOGSHIELD_INGEST_TOKENS` is a JSON map from agent name to its own token. Set `LOGSHIELD_PROXY_UID` to the UID:GID that owns the certificate files (for example, output of `id -u` and `id -g`). Do not commit `.env` or `secrets/`.
 
-## Operational limits
+Provide a certificate valid for the private hostname in `secrets/tls.crt` and `secrets/tls.key`. For a disposable localhost test only, generate a one-day self-signed certificate:
 
-The event correlation pass currently reloads up to 2,000 recent events and recalculates incidents. Only a [synthetic benign ingestion probe](PERFORMANCE.md) has been measured; sustained mixed-traffic throughput and latency remain unknown. Source labels from an application are not verified client IP addresses. There is no multi-tenant isolation, mTLS, key rotation workflow, complete file rotation handling, or high-availability failover. The optional SDK queue is single-owner and has no cross-process coordination or background scheduler. The UI is intended to be accessed through a trusted proxy; never put the operator token in public frontend JavaScript. Run the Docker end-to-end test and review the [evaluation limits](EVALUATION.md) before using real security data.
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj /CN=localhost -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -keyout deploy/production/secrets/tls.key -out deploy/production/secrets/tls.crt
+htpasswd -cB deploy/production/secrets/htpasswd viewer
+chmod 600 deploy/production/.env deploy/production/secrets/tls.key deploy/production/secrets/htpasswd
+```
+
+The proxy process runs under `LOGSHIELD_PROXY_UID` and needs read access to those files. On SELinux hosts, Compose relabels the three secret mounts for the container. TLS terminates at Nginx; a browser must pass HTTP Basic authentication. The proxy replaces browser `Authorization` with the viewer token for read-only API and WebSocket routes. Ingest routes preserve each agent's bearer token and have a request-rate limit. Never put the operator token in frontend JavaScript or a URL.
+
+```bash
+docker compose --env-file deploy/production/.env -f deploy/production/compose.yml build
+docker compose --env-file deploy/production/.env -f deploy/production/compose.yml up -d
+```
+
+The dashboard is `https://127.0.0.1:8443/`; the operator API is bound separately to **localhost only** at `http://127.0.0.1:3001`. Use an SSH tunnel for remote operator access. The API has no publicly bound port. `LAB_MODE=false` disables attack controls and automatic containment. Agents send to `https://<private-host>:8443/api/ingest/events` with their source token and a trusted TLS certificate. The application-reported client IP remains unverified metadata.
+
+## Baseline approval
+
+Authenticated agent successes enter a durable quarantine only when their event timestamps are within 30 days and not in the future. The operator must independently review the source before approving. Three distinct, incident-free successful event IDs, one hour of quarantine, and a ten-minute event boundary are required. Send a POST to the localhost operator API with the operator bearer token:
+
+```json
+{"username":"alice","source_ip":"192.0.2.9","hostname":"my-app","reviewed_benign":true}
+```
+
+Endpoint: `/api/baseline/approve`. Approved snapshots persist in SQLite and are used on later batches, including after restart. A successful login alone never promotes itself. Late discovery of a compromised approved account currently requires manual remediation; there is no automatic revocation of a poisoned snapshot.
+
+## Backup, restore, and upgrades
+
+```bash
+deploy/production/backup.sh /secure/backup/logshield.db
+deploy/production/restore.sh /secure/backup/logshield.db
+```
+
+The backup uses SQLite `VACUUM INTO`, producing a consistent snapshot while the API runs. The restore script copies a validated backup, stops the API, retains the previous database as `/state/pre-restore.db`, replaces the database, and restarts the API. Test restores on disposable data before relying on them. Keep backups encrypted and access restricted; they contain raw security evidence. For upgrades, take a backup, build the new image, recreate the API, verify health and sample evidence, then restore the backup if rollback is required. Never run `docker compose down -v` against real data.
+
+## Operating limits
+
+This configuration was exercised locally with TLS, dashboard auth, read-only viewer access, authenticated ingestion, WebSocket upgrade, restart persistence, disabled lab controls, and one backup/restore drill. It does not establish secure internet exposure or production capacity. The API still correlates up to 2,000 recent events after candidate batches. Source IP attribution depends on the integrating application; there is no mTLS, per-user sessions, high-availability failover, or independently measured field false-positive rate. Non-lab response adapters and automatic mitigation remain disabled.

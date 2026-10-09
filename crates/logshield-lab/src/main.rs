@@ -54,6 +54,11 @@ struct BlockRequest {
     duration_seconds: i64,
 }
 #[derive(Deserialize)]
+struct BlockKey {
+    source: String,
+    incident_id: String,
+}
+#[derive(Deserialize)]
 struct Login {
     username: String,
     password: String,
@@ -134,6 +139,8 @@ async fn main() {
                 .route("/internal/infra/revoke", post(infra_revoke))
                 .route("/internal/infra/session-active", post(infra_session_active))
                 .route("/internal/block", post(block))
+                .route("/internal/block/status", post(block_status))
+                .route("/internal/unblock", post(unblock))
                 .route("/internal/force-failure", post(force_failure))
                 .route("/internal/reset", post(reset_gateway))
                 .route("/infra/{*path}", post(proxy_infra))
@@ -517,7 +524,43 @@ async fn persist_blocks(s: &GatewayState, blocks: &HashMap<String, Block>) -> st
     }
     let tmp = s.block_file.with_extension("tmp");
     tokio::fs::write(&tmp, serde_json::to_vec(blocks).unwrap()).await?;
+    tokio::fs::File::open(&tmp).await?.sync_all().await?;
     tokio::fs::rename(tmp, &s.block_file).await
+}
+async fn block_status(
+    State(s): State<GatewayState>,
+    Json(key): Json<BlockKey>,
+) -> Json<serde_json::Value> {
+    let blocks = s.blocks.lock().await;
+    let active = blocks
+        .get(&key.source)
+        .is_some_and(|block| block.incident_id == key.incident_id && block.expires_at > Utc::now());
+    Json(serde_json::json!({"active":active,"incident_id":key.incident_id,"source":key.source}))
+}
+async fn unblock(State(s): State<GatewayState>, Json(key): Json<BlockKey>) -> Reply {
+    if *s.force_failure.lock().await {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"removed":false,"reason":"forced lab response failure"})),
+        ));
+    }
+    let mut blocks = s.blocks.lock().await;
+    if !blocks
+        .get(&key.source)
+        .is_some_and(|block| block.incident_id == key.incident_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"removed":false,"reason":"no matching incident block"})),
+        ));
+    }
+    let mut next = blocks.clone();
+    next.remove(&key.source);
+    persist_blocks(&s, &next).await.map_err(server_error)?;
+    *blocks = next;
+    Ok(Json(
+        serde_json::json!({"removed":true,"incident_id":key.incident_id,"source":key.source}),
+    ))
 }
 async fn block(State(s): State<GatewayState>, Json(body): Json<BlockRequest>) -> Reply {
     if *s.force_failure.lock().await {
@@ -543,8 +586,26 @@ async fn block(State(s): State<GatewayState>, Json(body): Json<BlockRequest>) ->
         expires_at: Utc::now() + Duration::seconds(body.duration_seconds),
     };
     let mut blocks = s.blocks.lock().await;
-    blocks.insert(body.source.clone(), record.clone());
-    persist_blocks(&s, &blocks).await.map_err(server_error)?;
+    if let Some(existing) = blocks
+        .get(&body.source)
+        .filter(|block| block.expires_at > Utc::now())
+    {
+        if existing.incident_id != record.incident_id {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({"applied":false,"reason":"source already blocked for another incident"}),
+                ),
+            ));
+        }
+        return Ok(Json(
+            serde_json::json!({"applied":true,"block":existing,"replayed":true}),
+        ));
+    }
+    let mut next = blocks.clone();
+    next.insert(body.source.clone(), record.clone());
+    persist_blocks(&s, &next).await.map_err(server_error)?;
+    *blocks = next;
     Ok(Json(serde_json::json!({"applied":true,"block":record})))
 }
 async fn force_failure(

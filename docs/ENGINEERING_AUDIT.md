@@ -1,4 +1,4 @@
-# LogShield TACG — Engineering audit in progress
+# LogShield TACG — Engineering audit and stabilization
 
 **Audit Baseline Commit:** `af93e5f5763f989664416758836351fe59db60fe`
 **Date:** October 10, 2026
@@ -26,14 +26,15 @@ The 60 scenarios are authored synthetic cases. They cannot establish field detec
 
 | ID | Component | Severity | Description | Proposed Fix | Status |
 |---|---|:---:|---|---|:---:|
-| **SEC-01** | Baseline and API | **High** | Historical successful logins are not independently verified benign. The new snapshot and quarantine library methods are not integrated with API decisions. | Keep private-mode familiarity baseline cold until an approved promotion store and authenticated review path exist. Use collector time for cutoff. | Partial: conservative API guard implemented; approved promotion remains open |
+| **SEC-01** | Baseline and API | **High** | Historical successful logins were not independently verified benign. Snapshot and quarantine methods were not connected to the private API. | Persist candidates and versioned snapshots; require an operator-reviewed promotion after quarantine, excluding incident evidence. | Implemented and restart-tested; source assertions still require independent review |
 | **DET-01** | `crates/logshield-core/src/tacg.rs` | **High** | Same-account paths miss single-source password spraying across distinct users. | Add a distinct-account source path and verify against benign shared-address cases. | Implemented locally; synthetic regression passes; field false-positive rate unknown |
 | **DET-02** | Evaluation | **Medium** | The 60-case benchmark did not distinguish decay from uniform edges. | Add a separate 140-second-gap regression; expand the held-out set later without tuning against final labels. | One regression passes; representative evidence open |
-| **RESP-01**| Response | **Medium** | The previous response record had no explicit stage. | Add stages while retaining old serialized records. Wire operator approval and expiry to actual gateway operations before claiming operational support. | Partial: enum added; lifecycle enforcement open |
+| **RESP-01**| Response | **Medium** | The previous response record had no explicit stage or verified rollback/expiry transition. | Preserve approval proof, match gateway source and incident, reconcile pending responses and lease expiry, implement authorized lab rollback. | Implemented and exercised in the isolated Docker lab; non-lab adapter disabled |
 | **AUTH-01**| API | **High** | One operator bearer token granted all protected access. Browsers need a trusted proxy for WebSocket authorization headers. | Add a separate viewer token for protected reads; test denied writes and WebSocket access. A session or proxy model and token rotation remain open. | Partial: viewer boundary integration test passes; deployment gate remains |
-| **PERF-01**| `crates/logshield-api/src/main.rs` & `database.rs` | **Medium** | **Full Database Scan on Every Batch:** `process_batch` executes `SELECT * FROM events ORDER BY timestamp DESC LIMIT 2000` on every ingested batch, incurring unnecessary CPU/memory overhead as event volume grows. | Implement windowed event queries (`WHERE timestamp >= ?`), add database indexes on `timestamp`, `source_ip`, and `username`. | Open |
+| **PERF-01**| `crates/logshield-api/src/main.rs` & `database.rs` | **Medium** | Correlation reloads up to 2,000 recent events and is costly under mixed traffic. | Index event time, skip benign-only source anchors, prune old candidate rows; retain the same detector for suspicious input. | Partial: four-producer mixed probe passed at 144 events/s with p95 batch latency 5.3 s; full incremental processing remains open |
 | **OPS-01** | `crates/logshield-api/src/main.rs` | **Medium** | **Missing Standard Telemetry & Health Probes:** API lacks standard Kubernetes/Prometheus observability (`/api/healthz`, `/api/readyz`, `/api/metrics`). | Add Prometheus-formatted metrics endpoint and standard liveness/readiness probes. | Open |
-| **DEP-01** | `deploy/` | **High** | **Lack of Isolated Production Deployment Manifest:** Repository only provided the lab environment with synthetic attackers and unauthenticated lab routes. No ready-to-run self-hosted non-lab production Compose manifest existed. | Create `deploy/production/` with hardened non-lab Compose manifest, reverse proxy (NGINX/TLS), non-root execution, and read-only container volumes. | Open |
+| **DEP-01** | `deploy/` | **High** | Repository only provided the lab environment. | Add a separate non-lab Compose stack with TLS, protected dashboard, source authentication, persistent evidence, backup/restore, and a disposable security smoke test. | Implemented; local smoke passed; real-host operation and external review remain open |
+| **AGENT-01** | File agent | **High** | An offset alone missed early records when a rotated replacement grew past the old offset before the agent reopened it. | Persist device and inode with the offset; recognize legacy numeric state and reset to byte zero on rotation or truncation. | Implemented; restart and larger-file rotation regression passes |
 
 ---
 
@@ -51,16 +52,10 @@ The 60 scenarios are authored synthetic cases. They cannot establish field detec
 
 ### 3.3 SEC-01: Baseline Lifecycle & Poisoning Defenses
 - **Root Cause:** A rolling baseline that updates on every ingestion batch without a quarantine period can gradually incorporate compromised account behavior if an adversary conducts slow, low-volume reconnaissance.
-- **Remediation status:** Versioned snapshot and quarantine methods exist in the core library, but the API has no authenticated approval store or durable promotion path. Private API processing therefore uses an empty trusted baseline; lab training retains historical learning for demonstrations. This avoids treating unreviewed successful logins as trusted in private mode but may increase alert noise.
+- **Remediation status:** The private API stores authenticated collector observations as quarantined candidates in SQLite. A separate operator review endpoint promotes only a specific candidate after three distinct incident-free observations, a one-hour quarantine, and a ten-minute event cutoff. The approved snapshot is persisted and restored after restart. A login success is never promoted automatically. The reported source address is still an application assertion, so the reviewer must independently confirm it. A later-discovered compromised approval is not automatically revoked.
 
 ---
 
-## 4. Remediation Plan
+## 4. Remaining operational gates
 
-1. **Phase 1:** Implement Password Spray detection in `crates/logshield-core/src/tacg.rs` and Snapshot-based Baseline in `crates/logshield-core/src/baseline.rs`.
-2. **Phase 2:** Update benchmark suite to verify Password Spray detection (improving recall from 85.7% to 100% or 35/35 attacks) and add temporal drift test cases demonstrating decay's edge-filtering value.
-3. **Phase 3:** Harden API authentication: role-based auth (Viewer vs Operator), constant-time token verification, and WebSocket authorization in `crates/logshield-api/src/main.rs`.
-4. **Phase 4:** Formalize response state machine in `crates/logshield-core/src/response.rs` and `crates/logshield-api/src/main.rs`.
-5. **Phase 5 & 6:** Database windowed queries, indexing, and SQLite concurrency hardening.
-6. **Phase 7 & 8:** Production deployment configuration in `deploy/production/`, Prometheus `/api/metrics`, and health probes.
-7. **Phase 9–12:** Complete documentation and production readiness gate.
+The 35/35 synthetic attack and 0/25 benign regression result is not an independent accuracy estimate. Full incremental correlation, sustained mixed-load sizing, field false-positive measurements, trusted remote-client attribution, certificate and token rotation, operational monitoring, and an external security review remain open. The intended designation is **integration beta** for a private, self-hosted network. See [Production readiness](PRODUCTION_READINESS.md) for each gate and [Deployment](DEPLOYMENT.md) for the tested localhost path.

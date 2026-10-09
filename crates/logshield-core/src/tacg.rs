@@ -794,6 +794,16 @@ pub fn correlate_with_config(
             if used.contains(&anchor.id) || claimed_ids.contains(&anchor.id) {
                 continue;
             }
+            // A benign-only anchor cannot produce an incident. Skipping its
+            // window avoids O(n²) scans of high-volume application traffic.
+            if !suspicious(anchor.event_type)
+                && !matches!(
+                    anchor.event_type,
+                    EventType::SuccessfulLogin | EventType::PasswordAccepted
+                )
+            {
+                continue;
+            }
             let group: Vec<_> = all
                 .iter()
                 .filter(|e| {
@@ -1147,6 +1157,37 @@ mod tests {
                     "{users} coworkers with {spacing}s spacing must not be classified as a spray"
                 );
             }
+        }
+    }
+    #[test]
+    fn familiar_shared_nat_mistakes_without_immediate_success_are_not_spraying() {
+        for users in [6, 12, 20] {
+            let mut history = Vec::new();
+            let mut failures = Vec::new();
+            for i in 0..users {
+                let user = format!("employee-{i}");
+                let host = ["infra-a", "infra-b", "infra-c"][i as usize % 3];
+                for prior in 0..3 {
+                    let mut success = auth_event(
+                        EventType::SuccessfulLogin,
+                        -3600 - prior,
+                        "office-nat",
+                        host,
+                    );
+                    success.username = Some(user.clone());
+                    history.push(success);
+                }
+                let mut failure = auth_event(EventType::FailedLogin, 0, "office-nat", host);
+                failure.username = Some(user);
+                failures.push(failure);
+            }
+            let baseline = Baseline::learn(&history);
+            assert!(
+                correlate(&failures, &baseline)
+                    .iter()
+                    .all(|incident| incident.kind != "PASSWORD SPRAY ATTACK"),
+                "{users} known coworkers behind a NAT must not be classified as a spray"
+            );
         }
     }
     #[test]

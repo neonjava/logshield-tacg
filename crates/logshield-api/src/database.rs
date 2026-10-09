@@ -18,12 +18,23 @@ pub async fn init(db: &SqlitePool) -> Result<(), sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS source_heartbeats(source TEXT PRIMARY KEY, seen_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS baseline_candidates(event_id TEXT PRIMARY KEY,username TEXT NOT NULL,source_ip TEXT NOT NULL,hostname TEXT NOT NULL,observed_at TEXT NOT NULL,event_ts TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS baseline_candidates_lookup ON baseline_candidates(username,source_ip,hostname,observed_at)",
+        "CREATE INDEX IF NOT EXISTS baseline_candidates_age ON baseline_candidates(observed_at)",
         "CREATE TABLE IF NOT EXISTS baseline_snapshots(version INTEGER PRIMARY KEY,payload TEXT NOT NULL,approved_at TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp DESC)",
     ] {
         sqlx::query(query).execute(db).await?;
     }
     Ok(())
+}
+pub async fn prune_candidates(db: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    Ok(
+        sqlx::query("DELETE FROM baseline_candidates WHERE observed_at<?")
+            .bind(cutoff)
+            .execute(db)
+            .await?
+            .rows_affected(),
+    )
 }
 pub async fn insert_event(db: &SqlitePool, e: &SecurityEvent) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin().await?;

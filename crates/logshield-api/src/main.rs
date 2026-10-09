@@ -74,6 +74,51 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|arg| arg == "--backup") {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = SqlitePool::connect(&url).await.expect("backup database");
+        let backup = "/state/logshield-backup.db";
+        let _ = std::fs::remove_file(backup);
+        sqlx::query("VACUUM INTO '/state/logshield-backup.db'")
+            .execute(&pool)
+            .await
+            .expect("consistent SQLite backup");
+        pool.close().await;
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--restore") {
+        let source = "/state/restore.db";
+        let pool = SqlitePool::connect(&format!("sqlite://{source}?mode=ro"))
+            .await
+            .expect("restore source");
+        let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .expect("integrity check");
+        assert_eq!(check, "ok", "restore source is corrupt");
+        pool.close().await;
+        let next = "/state/.restoring.db";
+        std::fs::copy(source, next).expect("copy validated backup");
+        std::fs::File::open(next).unwrap().sync_all().unwrap();
+        let db = "/state/logshield.db";
+        if std::path::Path::new(db).exists() {
+            std::fs::rename(db, "/state/pre-restore.db").expect("preserve previous database");
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db}{suffix}"));
+        }
+        std::fs::rename(next, db).expect("activate restored database");
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--healthcheck") {
+        let healthy = reqwest::Client::new()
+            .get("http://127.0.0.1:3000/api/health")
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok_and(|reply| reply.status().is_success());
+        std::process::exit(if healthy { 0 } else { 1 });
+    }
     tracing_subscriber::fmt::init();
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://logshield.db?mode=rwc".into());
@@ -121,6 +166,9 @@ async fn main() {
         viewer_token,
     };
     tokio::spawn(worker(state.clone(), rx));
+    if state.lab_mode {
+        tokio::spawn(reconcile_responses(state.clone()));
+    }
     tokio::spawn(sensor::start(
         log_dir,
         state.tx.clone(),
@@ -142,6 +190,7 @@ async fn main() {
         .route("/api/incidents", get(incidents))
         .route("/api/incidents/{id}", get(incident))
         .route("/api/incidents/{id}/respond", post(manual_response))
+        .route("/api/incidents/{id}/rollback", post(rollback_response))
         .route("/api/incidents/{id}/response", get(response_status))
         .route("/api/responses", get(responses))
         .route("/api/stats", get(stats))
@@ -258,7 +307,14 @@ fn load_ingest_tokens() -> HashMap<String, String> {
     tokens
 }
 async fn worker(state: AppState, mut rx: mpsc::Receiver<WorkItem>) {
+    let mut last_prune = std::time::Instant::now() - std::time::Duration::from_secs(3600);
     while let Some(work) = rx.recv().await {
+        if last_prune.elapsed() >= std::time::Duration::from_secs(3600) {
+            if let Err(error) = db::prune_candidates(&state.db).await {
+                tracing::error!(%error, "baseline candidate cleanup failed");
+            }
+            last_prune = std::time::Instant::now();
+        }
         let _guard = state.processing.lock().await;
         let result = process_batch(&state, &work.events).await;
         if let Err(err) = &result {
@@ -368,12 +424,17 @@ async fn execute_response(state: AppState, id: String, generation: u64) {
         .json(&payload)
         .send()
         .await;
-    let (applied, block_status, block_body) = match block_result {
+    let (mut applied, block_status, block_body) = match block_result {
         Ok(r) => {
             let status = r.status().as_u16();
             let body = r.json::<Value>().await.unwrap_or_default();
             (
-                status == 200 && body.get("applied") == Some(&Value::Bool(true)),
+                status == 200
+                    && body.get("applied") == Some(&Value::Bool(true))
+                    && body.pointer("/block/incident_id").and_then(Value::as_str)
+                        == Some(id.as_str())
+                    && body.pointer("/block/source").and_then(Value::as_str)
+                        == Some(source.as_str()),
                 status,
                 body,
             )
@@ -391,7 +452,35 @@ async fn execute_response(state: AppState, id: String, generation: u64) {
         Some(block_status),
     );
     if applied {
-        let _=sqlx::query("INSERT OR REPLACE INTO gateway_blocks(incident_id,source,expires_at,payload) VALUES(?,?,?,?)").bind(&id).bind(&source).bind(block_body.pointer("/block/expires_at").and_then(Value::as_str).unwrap_or("")).bind(block_body.to_string()).execute(&state.db).await;
+        let expiry = block_body
+            .pointer("/block/expires_at")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if chrono::DateTime::parse_from_rfc3339(expiry).is_err() {
+            applied = false;
+            response::record(
+                &mut incident,
+                "BLOCK_LEASE_UNTRACKED",
+                "gateway returned no valid lease expiry".into(),
+                None,
+            );
+        } else if let Err(error) = sqlx::query("INSERT OR REPLACE INTO gateway_blocks(incident_id,source,expires_at,payload) VALUES(?,?,?,?)")
+            .bind(&id)
+            .bind(&source)
+            .bind(expiry)
+            .bind(block_body.to_string())
+            .execute(&state.db)
+            .await
+        {
+            tracing::error!(%error, "gateway lease persistence failed");
+            applied = false;
+            response::record(
+                &mut incident,
+                "BLOCK_LEASE_UNTRACKED",
+                "gateway block cannot be tracked durably; operator review required".into(),
+                None,
+            );
+        }
     }
     let mut session_verified = true;
     if incident.kind == "SUSPICIOUS SUCCESSFUL LOGIN" || incident.kind == "UNUSUAL SUCCESSFUL LOGIN"
@@ -519,6 +608,87 @@ async fn execute_response(state: AppState, id: String, generation: u64) {
     let _ = state
         .broadcast
         .send(serde_json::json!({"type":"incident","incident":incident}).to_string());
+}
+async fn reconcile_responses(state: AppState) {
+    if let Ok(incidents) = db::incidents(&state.db).await {
+        for mut incident in incidents
+            .into_iter()
+            .filter(|i| i.status == IncidentStatus::PendingVerification)
+        {
+            let recent = incident
+                .response
+                .as_ref()
+                .is_some_and(|record| (Utc::now() - record.responded_at).num_seconds() < 60);
+            if recent {
+                let generation = state.reset_generation.load(Ordering::SeqCst);
+                execute_response(state.clone(), incident.id.to_string(), generation).await;
+            } else {
+                response::finish(&mut incident, false, 0, false);
+                let _ = db::save_incident(&state.db, &incident).await;
+            }
+        }
+    }
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tick.tick().await;
+        let rows = match sqlx::query("SELECT incident_id,source,expires_at FROM gateway_blocks")
+            .fetch_all(&state.db)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, "response reconciliation query failed");
+                continue;
+            }
+        };
+        for row in rows {
+            let id: String = row.get("incident_id");
+            let source: String = row.get("source");
+            let expires: String = row.get("expires_at");
+            let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&expires) else {
+                continue;
+            };
+            if expires.with_timezone(&Utc) > Utc::now() {
+                continue;
+            }
+            let _guard = state.response_gate.lock().await;
+            let status = state
+                .client
+                .post(format!("{}/internal/block/status", state.gateway))
+                .json(&serde_json::json!({"source":source,"incident_id":id}))
+                .send()
+                .await;
+            let inactive = match status {
+                Ok(reply) if reply.status().is_success() => {
+                    reply.json::<Value>().await.ok().is_some_and(|body| {
+                        body["active"] == false
+                            && body["incident_id"] == id
+                            && body["source"] == source
+                    })
+                }
+                _ => false,
+            };
+            if !inactive {
+                continue;
+            }
+            if let Ok(Some(mut incident)) = db::incident(&state.db, &id).await
+                && incident.status == IncidentStatus::Contained
+            {
+                response::expire(
+                    &mut incident,
+                    "gateway lease expired and enforcement is inactive",
+                );
+                if let Err(error) = db::save_incident(&state.db, &incident).await {
+                    tracing::error!(%error, "expiry save failed");
+                    continue;
+                }
+            }
+            let _ = sqlx::query("DELETE FROM gateway_blocks WHERE incident_id=?")
+                .bind(&id)
+                .execute(&state.db)
+                .await;
+        }
+    }
 }
 async fn health() -> Json<Value> {
     Json(serde_json::json!({"status":"ok","engine":"Rust TACG"}))
@@ -1086,6 +1256,7 @@ async fn incident(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         .ok_or((StatusCode::NOT_FOUND, "incident not found".into()))
 }
 async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Incident> {
+    let _guard = s.response_gate.lock().await;
     let mut i = db::incident(&s.db, &id)
         .await
         .map_err(internal)?
@@ -1114,6 +1285,8 @@ async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> A
     if i.response.is_some() {
         return Err((StatusCode::CONFLICT, "response already attempted".into()));
     }
+    response::request_approval(&mut i);
+    db::save_incident(&s.db, &i).await.map_err(internal)?;
     response::begin(&mut i);
     db::save_incident(&s.db, &i).await.map_err(internal)?;
     let state = s.clone();
@@ -1122,6 +1295,71 @@ async fn manual_response(State(s): State<AppState>, Path(id): Path<String>) -> A
         execute_response(state, id, generation).await;
     });
     Ok(Json(i))
+}
+async fn rollback_response(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Incident> {
+    if !s.lab_mode {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no private response adapter configured".into(),
+        ));
+    }
+    let _guard = s.response_gate.lock().await;
+    let mut incident = db::incident(&s.db, &id)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "incident not found".into()))?;
+    if incident.status != IncidentStatus::Contained
+        || incident.source_ip.as_deref() != Some("attacker-lab")
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "no active verified lab block for this incident".into(),
+        ));
+    }
+    let result = s
+        .client
+        .post(format!("{}/internal/unblock", s.gateway))
+        .json(&serde_json::json!({"source":"attacker-lab","incident_id":id}))
+        .send()
+        .await;
+    let removed = match result {
+        Ok(reply) if reply.status().is_success() => {
+            reply.json::<Value>().await.ok().is_some_and(|body| {
+                body["removed"] == true
+                    && body["incident_id"] == id
+                    && body["source"] == "attacker-lab"
+            })
+        }
+        _ => false,
+    };
+    if !removed {
+        response::record(
+            &mut incident,
+            "ROLLBACK_FAILED",
+            "gateway did not confirm removal of matching block".into(),
+            None,
+        );
+        db::save_incident(&s.db, &incident)
+            .await
+            .map_err(internal)?;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "gateway rollback failed; containment state retained".into(),
+        ));
+    }
+    response::rollback(&mut incident, "operator rollback verified by gateway");
+    db::save_incident(&s.db, &incident)
+        .await
+        .map_err(internal)?;
+    sqlx::query("DELETE FROM gateway_blocks WHERE incident_id=?")
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(internal)?;
+    Ok(Json(incident))
 }
 async fn response_status(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Value> {
     let i = db::incident(&s.db, &id)
