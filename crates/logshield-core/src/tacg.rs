@@ -10,9 +10,83 @@ use uuid::Uuid;
 const WINDOW_SECS: i64 = 600;
 const TAU: f64 = 90.0;
 
+/// Configuration flags controlling which TACG capabilities are active.
+/// Used for controlled ablation studies where exactly one feature is disabled at a time.
+#[derive(Debug, Clone)]
+pub struct CorrelationConfig {
+    /// Enable temporal edge decay between events (exp(-Δt/τ)).
+    /// When disabled, all edges within the window receive uniform weight 1.0.
+    pub temporal_decay: bool,
+    /// Enable graph-path-based failure connectivity for distributed detection.
+    /// When disabled, distributed detection uses flat failure counts instead of
+    /// connected same-account paths.
+    pub graph_edges: bool,
+    /// Enable behavioral baseline familiarity discounting.
+    /// When disabled, all activity is treated as unfamiliar (cold-start behavior).
+    pub baseline_familiarity: bool,
+    /// Enable identity-anchored correlation (Pass 2) for rotating-source attacks.
+    /// When disabled, only source-anchored (Pass 1) clustering is performed.
+    pub identity_correlation: bool,
+}
+
+impl Default for CorrelationConfig {
+    fn default() -> Self {
+        Self {
+            temporal_decay: true,
+            graph_edges: true,
+            baseline_familiarity: true,
+            identity_correlation: true,
+        }
+    }
+}
+
+impl CorrelationConfig {
+    /// Full TACG — all capabilities enabled.
+    pub fn full() -> Self {
+        Self::default()
+    }
+    /// Ablation: disable only graph edge connectivity.
+    pub fn no_graph_edges() -> Self {
+        Self {
+            graph_edges: false,
+            ..Self::default()
+        }
+    }
+    /// Ablation: disable only baseline familiarity discounting.
+    pub fn no_baseline() -> Self {
+        Self {
+            baseline_familiarity: false,
+            ..Self::default()
+        }
+    }
+    /// Ablation: disable only temporal decay (uniform edge weights).
+    pub fn no_temporal_decay() -> Self {
+        Self {
+            temporal_decay: false,
+            ..Self::default()
+        }
+    }
+    /// Ablation: disable only identity-anchored cross-source correlation.
+    pub fn no_identity_correlation() -> Self {
+        Self {
+            identity_correlation: false,
+            ..Self::default()
+        }
+    }
+}
+
 pub fn temporal_strength(a: &SecurityEvent, b: &SecurityEvent) -> f64 {
     let d = (a.timestamp - b.timestamp).num_seconds().unsigned_abs() as f64;
     (-d / TAU).exp()
+}
+/// Config-aware temporal strength: returns uniform 1.0 when decay is disabled.
+fn temporal_cfg(a: &SecurityEvent, b: &SecurityEvent, config: &CorrelationConfig) -> f64 {
+    if config.temporal_decay {
+        temporal_strength(a, b)
+    } else {
+        let d = (a.timestamp - b.timestamp).num_seconds().unsigned_abs();
+        if d <= WINDOW_SECS as u64 { 1.0 } else { 0.0 }
+    }
 }
 pub fn entity_strength(a: &SecurityEvent, b: &SecurityEvent) -> (f64, Vec<String>) {
     let mut n: f64 = 0.0;
@@ -68,9 +142,10 @@ fn suspicious(t: EventType) -> bool {
 }
 /// Link consecutive failures for each account. A distributed detection must
 /// span one connected path, rather than merely share a source counter.
-fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64) {
-    let mut previous: HashMap<&str, &SecurityEvent> = HashMap::new();
-    let mut edges = Vec::new();
+fn failure_paths(
+    events: &[SecurityEvent],
+    config: &CorrelationConfig,
+) -> (Vec<GraphEdge>, usize, usize, f64) {
     let failures: HashMap<Uuid, &SecurityEvent> = events
         .iter()
         .filter(|e| {
@@ -78,6 +153,32 @@ fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64
         })
         .map(|e| (e.id, e))
         .collect();
+
+    if !config.graph_edges {
+        // Ablation: flat failure counting across the cluster without graph path connectivity.
+        // Evaluates flat failure count and host dispersion without requiring a same-account connected graph path.
+        let failure_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::FailedLogin)
+            .count();
+        let hosts: HashSet<&str> = events
+            .iter()
+            .filter(|e| e.event_type == EventType::FailedLogin)
+            .filter_map(|e| e.hostname.as_deref())
+            .collect();
+        let cross = if hosts.len() >= 3 && failure_count >= 5 {
+            1.0
+        } else if hosts.len() >= 2 && failure_count >= 4 {
+            0.7
+        } else {
+            0.0
+        };
+        return (Vec::new(), failure_count, hosts.len(), cross);
+    }
+
+    // Full graph path construction
+    let mut previous: HashMap<&str, &SecurityEvent> = HashMap::new();
+    let mut edges = Vec::new();
     for event in events
         .iter()
         .filter(|e| e.event_type == EventType::FailedLogin)
@@ -89,13 +190,13 @@ fn failure_paths(events: &[SecurityEvent]) -> (Vec<GraphEdge>, usize, usize, f64
             continue;
         }
         let prior = previous.insert(user, event);
-        let connected = prior.is_some_and(|old| temporal_strength(old, event) >= 0.35);
+        let connected = prior.is_some_and(|old| temporal_cfg(old, event, config) >= 0.35);
         if let Some(old) = prior.filter(|_| connected) {
             let (entity, _) = entity_strength(old, event);
             edges.push(GraphEdge {
                 from: old.id,
                 to: event.id,
-                strength: (0.6 * temporal_strength(old, event) + 0.4 * entity).min(1.0),
+                strength: (0.6 * temporal_cfg(old, event, config) + 0.4 * entity).min(1.0),
                 reasons: vec![
                     "same source".into(),
                     "same username".into(),
@@ -223,6 +324,7 @@ fn evaluate_cluster(
     group: &[SecurityEvent],
     baseline: &Baseline,
     anchor_source: Option<String>,
+    config: &CorrelationConfig,
 ) -> Option<Incident> {
     let failures = group
         .iter()
@@ -241,7 +343,7 @@ fn evaluate_cluster(
         .iter()
         .filter_map(|e| e.source_ip.as_deref())
         .collect();
-    let (failure_edges, path_failures, path_hosts, cross) = failure_paths(group);
+    let (failure_edges, path_failures, path_hosts, cross) = failure_paths(group, config);
     let mut edges = Vec::new();
     let mut temporal_total = 0.0;
     let mut entity_total = 0.0;
@@ -250,13 +352,13 @@ fn evaluate_cluster(
     for pair in group.windows(2) {
         let a = &pair[0];
         let b = &pair[1];
-        let temporal = temporal_strength(a, b);
+        let temporal = temporal_cfg(a, b, config);
         let (entity, mut reasons) = entity_strength(a, b);
         let tr = transition(a.event_type, b.event_type);
         if tr > 0.0 {
             reasons.push(format!("{:?} → {:?}", a.event_type, b.event_type));
         }
-        if temporal > 0.1 && entity > 0.0 {
+        if config.graph_edges && temporal > 0.1 && entity > 0.0 {
             edges.push(GraphEdge {
                 from: a.id,
                 to: b.id,
@@ -269,12 +371,14 @@ fn evaluate_cluster(
         transition_total += tr;
         count += 1.0;
     }
-    for edge in failure_edges {
-        if !edges
-            .iter()
-            .any(|existing| existing.from == edge.from && existing.to == edge.to)
-        {
-            edges.push(edge);
+    if config.graph_edges {
+        for edge in failure_edges {
+            if !edges
+                .iter()
+                .any(|existing| existing.from == edge.from && existing.to == edge.to)
+            {
+                edges.push(edge);
+            }
         }
     }
     let types: HashSet<_> = group
@@ -296,7 +400,11 @@ fn evaluate_cluster(
     let distributed = cross >= 1.0;
     let is_rotating_sources = sources.len() >= 3 && path_failures >= 4;
 
-    let familiar_auth = is_familiar_auth(group, baseline);
+    let familiar_auth = if config.baseline_familiarity {
+        is_familiar_auth(group, baseline)
+    } else {
+        false
+    };
 
     let repeated_mfa = group
         .iter()
@@ -392,15 +500,23 @@ fn evaluate_cluster(
     } else {
         0.60
     };
-    let temporal = if count > 0.0 {
-        temporal_total / count
+    let temporal = if config.graph_edges {
+        if count > 0.0 {
+            temporal_total / count
+        } else {
+            0.0
+        }
     } else {
-        0.0
+        0.5
     };
-    let entity = if count > 0.0 {
-        entity_total / count
+    let entity = if config.graph_edges {
+        if count > 0.0 {
+            entity_total / count
+        } else {
+            0.0
+        }
     } else {
-        0.0
+        0.5
     };
     let transition_score = if familiar_auth {
         0.35
@@ -417,7 +533,12 @@ fn evaluate_cluster(
     } else {
         transition_total / count.max(1.0)
     };
-    let behaviour = baseline.deviation(group).max(if familiar_auth {
+    let base_dev = if config.baseline_familiarity {
+        baseline.deviation(group)
+    } else {
+        0.5
+    };
+    let behaviour = base_dev.max(if familiar_auth {
         0.0
     } else if full_chain {
         0.8
@@ -572,6 +693,14 @@ fn evaluate_cluster(
 }
 
 pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident> {
+    correlate_with_config(events, baseline, &CorrelationConfig::full())
+}
+
+pub fn correlate_with_config(
+    events: &[SecurityEvent],
+    baseline: &Baseline,
+    config: &CorrelationConfig,
+) -> Vec<Incident> {
     let mut sorted: Vec<_> = events
         .iter()
         .filter(|e| e.hostname.as_deref() != Some("gateway"))
@@ -614,7 +743,8 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
             {
                 continue;
             }
-            if let Some(incident) = evaluate_cluster(&group, baseline, Some(source.clone())) {
+            if let Some(incident) = evaluate_cluster(&group, baseline, Some(source.clone()), config)
+            {
                 for e in &incident.events {
                     used.insert(e.id);
                     claimed_ids.insert(e.id);
@@ -625,60 +755,62 @@ pub fn correlate(events: &[SecurityEvent], baseline: &Baseline) -> Vec<Incident>
     }
 
     // Pass 2: Identity-anchored correlation (cross-source attacks targeting single identities, rotating IPs)
-    let mut identity_groups: HashMap<String, Vec<SecurityEvent>> = HashMap::new();
-    for e in &sorted {
-        if claimed_ids.contains(&e.id) {
-            continue;
-        }
-        let matches = match &e.username {
-            Some(user) => {
-                !user.is_empty()
-                    && (suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
-            }
-            None => false,
-        };
-        if matches {
-            identity_groups
-                .entry(e.username.clone().unwrap())
-                .or_default()
-                .push(e.clone());
-        }
-    }
-    for (_user, all_user) in identity_groups {
-        let unique_sources: HashSet<_> = all_user
-            .iter()
-            .filter_map(|e| e.source_ip.as_deref())
-            .collect();
-        if unique_sources.len() < 2 {
-            continue;
-        }
-        let mut used = HashSet::new();
-        for anchor in &all_user {
-            if used.contains(&anchor.id) || claimed_ids.contains(&anchor.id) {
+    if config.identity_correlation {
+        let mut identity_groups: HashMap<String, Vec<SecurityEvent>> = HashMap::new();
+        for e in &sorted {
+            if claimed_ids.contains(&e.id) {
                 continue;
             }
-            let group: Vec<_> = all_user
-                .iter()
-                .filter(|e| {
-                    (e.timestamp - anchor.timestamp).num_seconds().abs() <= WINDOW_SECS
-                        && !used.contains(&e.id)
-                        && !claimed_ids.contains(&e.id)
-                })
-                .cloned()
-                .collect();
-            let sources_in_group: HashSet<_> = group
+            let matches = match &e.username {
+                Some(user) => {
+                    !user.is_empty()
+                        && (suspicious(e.event_type) || e.event_type == EventType::SuccessfulLogin)
+                }
+                None => false,
+            };
+            if matches {
+                identity_groups
+                    .entry(e.username.clone().unwrap())
+                    .or_default()
+                    .push(e.clone());
+            }
+        }
+        for (_user, all_user) in identity_groups {
+            let unique_sources: HashSet<_> = all_user
                 .iter()
                 .filter_map(|e| e.source_ip.as_deref())
                 .collect();
-            if sources_in_group.len() < 2 {
+            if unique_sources.len() < 2 {
                 continue;
             }
-            if let Some(incident) = evaluate_cluster(&group, baseline, None) {
-                for e in &incident.events {
-                    used.insert(e.id);
-                    claimed_ids.insert(e.id);
+            let mut used = HashSet::new();
+            for anchor in &all_user {
+                if used.contains(&anchor.id) || claimed_ids.contains(&anchor.id) {
+                    continue;
                 }
-                incidents.push(incident);
+                let group: Vec<_> = all_user
+                    .iter()
+                    .filter(|e| {
+                        (e.timestamp - anchor.timestamp).num_seconds().abs() <= WINDOW_SECS
+                            && !used.contains(&e.id)
+                            && !claimed_ids.contains(&e.id)
+                    })
+                    .cloned()
+                    .collect();
+                let sources_in_group: HashSet<_> = group
+                    .iter()
+                    .filter_map(|e| e.source_ip.as_deref())
+                    .collect();
+                if sources_in_group.len() < 2 {
+                    continue;
+                }
+                if let Some(incident) = evaluate_cluster(&group, baseline, None, config) {
+                    for e in &incident.events {
+                        used.insert(e.id);
+                        claimed_ids.insert(e.id);
+                    }
+                    incidents.push(incident);
+                }
             }
         }
     }
@@ -840,5 +972,72 @@ mod tests {
             })
             .collect();
         assert!(correlate(&events, &Baseline::learn(&events)).is_empty());
+    }
+    #[test]
+    fn ablation_no_graph_edges_produces_empty_edges() {
+        let events = scenario("distributed");
+        let incidents = correlate_with_config(
+            &events,
+            &Baseline::default(),
+            &CorrelationConfig::no_graph_edges(),
+        );
+        assert!(!incidents.is_empty());
+        assert!(
+            incidents[0].edges.is_empty(),
+            "Graph-disabled TACG must not construct graph edges"
+        );
+    }
+    #[test]
+    fn ablation_no_baseline_does_not_discount_familiar_activity() {
+        let failures = scenario("distributed");
+        let source = failures[0].source_ip.as_deref().unwrap();
+        let mut normal = Vec::new();
+        for (index, host) in ["server-a", "server-b", "server-c"].iter().enumerate() {
+            normal.push(auth_event(
+                EventType::SuccessfulLogin,
+                index as i64,
+                source,
+                host,
+            ));
+            normal.last_mut().unwrap().username = Some("admin".into());
+        }
+        let baseline = Baseline::learn(&normal);
+        // With baseline enabled, familiar activity has lower risk
+        let with_base =
+            correlate_with_config(&failures, &baseline, &CorrelationConfig::full()).remove(0);
+        // With baseline disabled, no discounting occurs, risk is higher
+        let without_base =
+            correlate_with_config(&failures, &baseline, &CorrelationConfig::no_baseline())
+                .remove(0);
+        assert!(without_base.risk >= with_base.risk);
+    }
+    #[test]
+    fn ablation_no_identity_correlation_ignores_cross_source_accounts() {
+        let mut events = Vec::new();
+        for i in 0..5 {
+            let mut e = auth_event(
+                EventType::FailedLogin,
+                i * 10,
+                &format!("198.51.100.{}", i + 1),
+                "server-a",
+            );
+            e.username = Some("target_user".into());
+            events.push(e);
+        }
+        let with_ident =
+            correlate_with_config(&events, &Baseline::default(), &CorrelationConfig::full());
+        assert!(
+            !with_ident.is_empty(),
+            "Full TACG must detect rotating sources"
+        );
+        let without_ident = correlate_with_config(
+            &events,
+            &Baseline::default(),
+            &CorrelationConfig::no_identity_correlation(),
+        );
+        assert!(
+            without_ident.is_empty(),
+            "Ablation without identity correlation must ignore cross-source accounts"
+        );
     }
 }

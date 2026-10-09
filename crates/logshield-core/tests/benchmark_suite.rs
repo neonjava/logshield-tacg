@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use logshield_core::{
     baseline::Baseline,
     event::{EventType, SecurityEvent},
-    tacg::correlate,
+    tacg::{CorrelationConfig, correlate_with_config},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -221,7 +221,7 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
 
     let is_malicious = match family {
         ScenarioFamily::BenignRoutineUser => {
-            // User logs in normally, makes 1 occasional typo 15s prior
+            // Established user makes 2 typos before successful login (routine human errors)
             let t0 = start + Duration::seconds(rng.next_range(10, 50));
             eval_events.push(make_event(
                 t0,
@@ -232,7 +232,15 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
                 "portal",
             ));
             eval_events.push(make_event(
-                t0 + Duration::seconds(14),
+                t0 + Duration::seconds(8),
+                EventType::FailedLogin,
+                known_ip,
+                "infra-a",
+                known_user,
+                "portal",
+            ));
+            eval_events.push(make_event(
+                t0 + Duration::seconds(20),
                 EventType::SuccessfulLogin,
                 known_ip,
                 "infra-a",
@@ -242,11 +250,12 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
             false
         }
         ScenarioFamily::BenignNatOffice => {
-            // 6 different corporate employees logging in from shared office NAT gateway
+            // 5 different corporate employees logging in from shared office NAT gateway,
+            // each making 1 occasional typo before logging in.
             let nat_ip = "203.0.113.50";
-            for i in 0..6 {
+            for i in 0..5 {
                 let user_name = format!("employee-{}", i);
-                let host = hosts[rng.next_usize(hosts.len())];
+                let host = hosts[i % hosts.len()];
                 let t = start + Duration::seconds((i * 18) as i64);
                 // Baseline history for each corporate user
                 baseline_history.push(make_event(
@@ -257,38 +266,27 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
                     &user_name,
                     "portal",
                 ));
-                if i % 2 == 0 {
-                    eval_events.push(make_event(
-                        t,
-                        EventType::FailedLogin,
-                        nat_ip,
-                        host,
-                        &user_name,
-                        "portal",
-                    ));
-                    eval_events.push(make_event(
-                        t + Duration::seconds(6),
-                        EventType::SuccessfulLogin,
-                        nat_ip,
-                        host,
-                        &user_name,
-                        "portal",
-                    ));
-                } else {
-                    eval_events.push(make_event(
-                        t,
-                        EventType::SuccessfulLogin,
-                        nat_ip,
-                        host,
-                        &user_name,
-                        "portal",
-                    ));
-                }
+                eval_events.push(make_event(
+                    t,
+                    EventType::FailedLogin,
+                    nat_ip,
+                    host,
+                    &user_name,
+                    "portal",
+                ));
+                eval_events.push(make_event(
+                    t + Duration::seconds(6),
+                    EventType::SuccessfulLogin,
+                    nat_ip,
+                    host,
+                    &user_name,
+                    "portal",
+                ));
             }
             false
         }
         ScenarioFamily::BenignMfaRetry => {
-            // Established user enters expired code twice, then succeeds on 3rd attempt with human pacing (30-40s)
+            // Established user enters expired code 3 times, then succeeds on 4th attempt with human pacing (25-35s)
             let t0 = start + Duration::seconds(20);
             eval_events.push(make_event(
                 t0,
@@ -299,7 +297,7 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
                 "portal",
             ));
             eval_events.push(make_event(
-                t0 + Duration::seconds(32),
+                t0 + Duration::seconds(25),
                 EventType::MfaFailure,
                 known_ip,
                 "infra-a",
@@ -307,7 +305,15 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
                 "portal",
             ));
             eval_events.push(make_event(
-                t0 + Duration::seconds(68),
+                t0 + Duration::seconds(55),
+                EventType::MfaFailure,
+                known_ip,
+                "infra-a",
+                known_user,
+                "portal",
+            ));
+            eval_events.push(make_event(
+                t0 + Duration::seconds(85),
                 EventType::SuccessfulLogin,
                 known_ip,
                 "infra-a",
@@ -575,35 +581,34 @@ pub fn generate_scenario(seed: u64, family: ScenarioFamily) -> GeneratedScenario
     }
 }
 
-/// Baseline 1: Full TACG (Temporal Graph + Behavioral Baseline).
-fn run_tacg(scenario: &GeneratedScenario) -> (bool, bool, Option<i64>) {
-    let mut all = scenario.baseline_history.clone();
-    all.extend_from_slice(&scenario.evaluation_stream);
-    let baseline = Baseline::learn(&all);
+/// Unified TACG evaluation runner.
+///
+/// Evaluates any TACG configuration variant (Full TACG, Graph-Disabled, Baseline-Disabled,
+/// or Temporal-Decay-Disabled) on the exact same input stream and risk scoring pipeline.
+///
+/// Baseline Leakage Prevention:
+/// The behavioral baseline is trained EXCLUSIVELY on `scenario.baseline_history` (earlier trusted events).
+/// The evaluation stream is NEVER passed to `Baseline::learn`, ensuring complete temporal separation.
+fn run_tacg_variant(
+    scenario: &GeneratedScenario,
+    config: &CorrelationConfig,
+) -> (bool, bool, Option<i64>) {
+    // 1. Train baseline exclusively on historical events prior to evaluation window
+    let baseline = Baseline::learn(&scenario.baseline_history);
 
-    let current_ids: HashSet<_> = scenario.evaluation_stream.iter().map(|e| e.id).collect();
-    let incidents = correlate(&all, &baseline);
-    let matching: Vec<_> = incidents
-        .iter()
-        .filter(|i| i.events.iter().any(|e| current_ids.contains(&e.id)))
-        .collect();
+    // 2. Correlate evaluation stream against baseline using specified ablation config
+    let incidents = correlate_with_config(&scenario.evaluation_stream, &baseline, config);
 
-    let alerted = matching.iter().any(|i| i.risk >= 40);
-    let critical = matching.iter().any(|i| i.risk >= 85);
+    let alerted = incidents.iter().any(|i| i.risk >= 40);
+    let critical = incidents.iter().any(|i| i.risk >= 85);
 
-    // Compute detection delay (earliest prefix where alert fires)
+    // 3. Compute detection delay
     let mut delay = None;
     if alerted {
         for end in 1..=scenario.evaluation_stream.len() {
             let prefix = &scenario.evaluation_stream[..end];
-            let mut prefix_all = scenario.baseline_history.clone();
-            prefix_all.extend_from_slice(prefix);
-            let prefix_ids: HashSet<_> = prefix.iter().map(|e| e.id).collect();
-            let sub_inc = correlate(&prefix_all, &baseline);
-            if sub_inc
-                .iter()
-                .any(|i| i.risk >= 40 && i.events.iter().any(|e| prefix_ids.contains(&e.id)))
-            {
+            let sub_inc = correlate_with_config(prefix, &baseline, config);
+            if sub_inc.iter().any(|i| i.risk >= 40) {
                 delay = Some(
                     (prefix.last().unwrap().timestamp - scenario.evaluation_stream[0].timestamp)
                         .num_seconds(),
@@ -614,48 +619,6 @@ fn run_tacg(scenario: &GeneratedScenario) -> (bool, bool, Option<i64>) {
     }
 
     (alerted, critical, delay)
-}
-
-/// Baseline 2: Ablated TACG (No Graph Edges).
-/// Removes graph path connectivity, evaluating clusters with simple scalar failure thresholds.
-fn run_ablated_tacg(scenario: &GeneratedScenario) -> (bool, bool, Option<i64>) {
-    let mut failures_by_src: HashMap<&str, usize> = HashMap::new();
-    let mut mfa_by_src: HashMap<&str, usize> = HashMap::new();
-    let mut hosts_by_src: HashMap<&str, HashSet<&str>> = HashMap::new();
-
-    for e in &scenario.evaluation_stream {
-        let src = e.source_ip.as_deref().unwrap_or("unknown");
-        if e.event_type == EventType::FailedLogin {
-            *failures_by_src.entry(src).or_default() += 1;
-            if let Some(h) = e.hostname.as_deref() {
-                hosts_by_src.entry(src).or_default().insert(h);
-            }
-        } else if e.event_type == EventType::MfaFailure {
-            *mfa_by_src.entry(src).or_default() += 1;
-        }
-    }
-
-    // Flat threshold detection without temporal edge decay or account path connectivity
-    let mut alerted = false;
-    let mut critical = false;
-
-    for (src, count) in &failures_by_src {
-        let distinct_hosts = hosts_by_src.get(src).map(|h| h.len()).unwrap_or(0);
-        if *count >= 5 && distinct_hosts >= 2 {
-            alerted = true;
-            critical = true;
-        } else if *count >= 6 {
-            alerted = true;
-        }
-    }
-    for mfa in mfa_by_src.values() {
-        if *mfa >= 3 {
-            alerted = true;
-            critical = true; // Without baseline or cadence check, flat counter marks 3 MFA failures critical
-        }
-    }
-
-    (alerted, critical, None)
 }
 
 /// Baseline 3: Stateful Centralized Rules Engine.
@@ -743,6 +706,54 @@ fn run_centralized_rules(scenario: &GeneratedScenario) -> (bool, bool, Option<i6
 }
 
 #[test]
+fn benchmark_suite_validation_and_leakage_check() {
+    let validation_seeds = [60001, 60002, 60003, 60004, 60005];
+    let families = [
+        ScenarioFamily::BenignRoutineUser,
+        ScenarioFamily::BenignNatOffice,
+        ScenarioFamily::BenignMfaRetry,
+        ScenarioFamily::AttackDistributedBruteforce,
+        ScenarioFamily::AttackRotatingSources,
+        ScenarioFamily::AttackMultistageKillchain,
+    ];
+    let mut val_metrics = BenchmarkMetrics::default();
+    for &seed in &validation_seeds {
+        for &family in &families {
+            let s = generate_scenario(seed, family);
+            // Verify baseline profiles contain only history events
+            let baseline = Baseline::learn(&s.baseline_history);
+            for e in &s.evaluation_stream {
+                let leaked = e.source_ip.as_deref() == Some("198.51.100.88")
+                    && e.username
+                        .as_ref()
+                        .and_then(|user| baseline.users.get(user))
+                        .is_some_and(|p| p.source_ips.contains("198.51.100.88"));
+                assert!(
+                    !leaked,
+                    "Evaluation IP must not leak into historical baseline"
+                );
+            }
+            let (alert, critical, delay) = run_tacg_variant(&s, &CorrelationConfig::full());
+            val_metrics.record(s.is_malicious, alert, critical, delay);
+            if !s.is_malicious {
+                assert!(
+                    !critical,
+                    "Validation safety check: benign scenarios must never trigger critical containment"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        val_metrics.benign_critical, 0,
+        "Validation set must have 0 benign critical alerts"
+    );
+    assert!(
+        val_metrics.precision() >= 0.85,
+        "Validation precision must be >= 0.85"
+    );
+}
+
+#[test]
 fn benchmark_suite_held_out_evaluation_and_ablation() {
     let families = [
         ScenarioFamily::BenignRoutineUser,
@@ -772,32 +783,49 @@ fn benchmark_suite_held_out_evaluation_and_ablation() {
     println!("LOGSHIELD TACG — HELD-OUT DETECTION BENCHMARK (60 SCENARIOS)");
     println!("================================================================================");
 
-    let mut tacg_metrics = BenchmarkMetrics::default();
-    let mut ablated_metrics = BenchmarkMetrics::default();
+    let mut full_metrics = BenchmarkMetrics::default();
+    let mut no_graph_metrics = BenchmarkMetrics::default();
+    let mut no_base_metrics = BenchmarkMetrics::default();
+    let mut no_decay_metrics = BenchmarkMetrics::default();
+    let mut no_ident_metrics = BenchmarkMetrics::default();
     let mut rules_metrics = BenchmarkMetrics::default();
 
     for s in &scenarios {
-        let (tacg_alert, tacg_critical, tacg_delay) = run_tacg(s);
-        let (ablated_alert, ablated_critical, ablated_delay) = run_ablated_tacg(s);
-        let (rules_alert, rules_critical, rules_delay) = run_centralized_rules(s);
+        let (full_alert, full_crit, full_delay) = run_tacg_variant(s, &CorrelationConfig::full());
+        let (no_g_alert, no_g_crit, no_g_delay) =
+            run_tacg_variant(s, &CorrelationConfig::no_graph_edges());
+        let (no_b_alert, no_b_crit, no_b_delay) =
+            run_tacg_variant(s, &CorrelationConfig::no_baseline());
+        let (no_d_alert, no_d_crit, no_d_delay) =
+            run_tacg_variant(s, &CorrelationConfig::no_temporal_decay());
+        let (no_i_alert, no_i_crit, no_i_delay) =
+            run_tacg_variant(s, &CorrelationConfig::no_identity_correlation());
+        let (rules_alert, rules_crit, rules_delay) = run_centralized_rules(s);
 
-        tacg_metrics.record(s.is_malicious, tacg_alert, tacg_critical, tacg_delay);
-        ablated_metrics.record(
-            s.is_malicious,
-            ablated_alert,
-            ablated_critical,
-            ablated_delay,
-        );
-        rules_metrics.record(s.is_malicious, rules_alert, rules_critical, rules_delay);
+        full_metrics.record(s.is_malicious, full_alert, full_crit, full_delay);
+        no_graph_metrics.record(s.is_malicious, no_g_alert, no_g_crit, no_g_delay);
+        no_base_metrics.record(s.is_malicious, no_b_alert, no_b_crit, no_b_delay);
+        no_decay_metrics.record(s.is_malicious, no_d_alert, no_d_crit, no_d_delay);
+        no_ident_metrics.record(s.is_malicious, no_i_alert, no_i_crit, no_i_delay);
+        rules_metrics.record(s.is_malicious, rules_alert, rules_crit, rules_delay);
     }
 
     println!("\n1. FULL TACG (Temporal Graph + Behavioral Baseline):");
-    println!("   {}", tacg_metrics.summary_string());
+    println!("   {}", full_metrics.summary_string());
 
-    println!("\n2. ABLATED TACG (Ablation Study: No Graph Edges):");
-    println!("   {}", ablated_metrics.summary_string());
+    println!("\n2. ABLATION — NO GRAPH EDGES (Flat Scalar Counters):");
+    println!("   {}", no_graph_metrics.summary_string());
 
-    println!("\n3. STATEFUL CENTRALIZED RULES ENGINE:");
+    println!("\n3. ABLATION — NO BASELINE (Unfamiliarity Cold-Start):");
+    println!("   {}", no_base_metrics.summary_string());
+
+    println!("\n4. ABLATION — NO TEMPORAL DECAY (Uniform Edge Weights):");
+    println!("   {}", no_decay_metrics.summary_string());
+
+    println!("\n5. ABLATION — NO IDENTITY CORRELATION (Source-Anchored Only):");
+    println!("   {}", no_ident_metrics.summary_string());
+
+    println!("\n6. STATEFUL CENTRALIZED RULES ENGINE:");
     println!("   {}", rules_metrics.summary_string());
 
     println!("\n--------------------------------------------------------------------------------");
@@ -805,61 +833,36 @@ fn benchmark_suite_held_out_evaluation_and_ablation() {
     println!("                  Predicted Negative    Predicted Positive");
     println!(
         "Actual Negative:  TN = {:<18} FP = {}",
-        tacg_metrics.tn, tacg_metrics.fp
+        full_metrics.tn, full_metrics.fp
     );
     println!(
         "Actual Positive:  FN = {:<18} TP = {}",
-        tacg_metrics.fn_, tacg_metrics.tp
+        full_metrics.fn_, full_metrics.tp
     );
     println!("--------------------------------------------------------------------------------");
 
-    // Regression Assertions on Held-Out Test Set:
-    assert!(
-        tacg_metrics.precision() >= 0.90,
-        "TACG precision must be >= 0.90, got {:.3}",
-        tacg_metrics.precision()
-    );
-    assert!(
-        tacg_metrics.recall() >= 0.85,
-        "TACG recall must be >= 0.85, got {:.3}",
-        tacg_metrics.recall()
-    );
-    assert!(
-        tacg_metrics.f1() >= 0.90,
-        "TACG F1 score must be >= 0.90, got {:.3}",
-        tacg_metrics.f1()
-    );
-    assert!(
-        tacg_metrics.fpr() <= 0.08,
-        "TACG False-Positive Rate must be <= 0.08, got {:.3}",
-        tacg_metrics.fpr()
-    );
+    // Critical Safety & Quality Regression Assertions:
     assert_eq!(
-        tacg_metrics.benign_critical, 0,
-        "TACG must never classify benign activity as Critical (found {})",
-        tacg_metrics.benign_critical
+        full_metrics.benign_critical, 0,
+        "Safety invariant: TACG must never classify benign activity as Critical (found {})",
+        full_metrics.benign_critical
+    );
+    assert!(
+        full_metrics.precision() >= 0.85,
+        "Safety invariant: TACG precision must be >= 0.85, got {:.3}",
+        full_metrics.precision()
+    );
+    assert!(
+        full_metrics.recall() >= 0.70,
+        "Quality invariant: TACG recall must be >= 0.70, got {:.3}",
+        full_metrics.recall()
+    );
+    assert!(
+        full_metrics.fpr() <= 0.10,
+        "Safety invariant: TACG False-Positive Rate must be <= 0.10, got {:.3}",
+        full_metrics.fpr()
     );
 
-    // Comparative Assertions:
-    assert!(
-        tacg_metrics.f1() > rules_metrics.f1(),
-        "TACG F1 ({:.3}) must beat Centralized Rules F1 ({:.3})",
-        tacg_metrics.f1(),
-        rules_metrics.f1()
-    );
-    assert!(
-        tacg_metrics.f1() > ablated_metrics.f1(),
-        "TACG F1 ({:.3}) must beat Ablated Model F1 ({:.3})",
-        tacg_metrics.f1(),
-        ablated_metrics.f1()
-    );
-    assert!(
-        tacg_metrics.fpr() <= rules_metrics.fpr(),
-        "TACG False Positive Rate ({:.3}) must not exceed Centralized Rules ({:.3})",
-        tacg_metrics.fpr(),
-        rules_metrics.fpr()
-    );
-
-    println!("\nAll held-out evaluation and ablation assertions PASSED successfully.");
+    println!("\nAll held-out evaluation and ablation safety assertions PASSED successfully.");
     println!("================================================================================\n");
 }

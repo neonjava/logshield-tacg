@@ -264,8 +264,16 @@ async fn process_batch(state: &AppState, batch: &[SecurityEvent]) -> Result<(), 
         return Ok(());
     }
     let all = db::events(&state.db).await.map_err(|e| e.to_string())?;
-    let baseline = Baseline::learn(&all);
     let existing = db::incidents(&state.db).await.map_err(|e| e.to_string())?;
+    // Enforce explicit training boundary: only events older than the 600s active correlation window
+    // can train the baseline, strictly preventing active evaluation events from leaking into profiles.
+    let latest_ts = all.iter().map(|e| e.timestamp).max();
+    let cutoff = latest_ts.map(|ts| ts - chrono::Duration::seconds(600));
+    let incident_event_ids: std::collections::HashSet<_> = existing
+        .iter()
+        .flat_map(|i| i.events.iter().map(|e| e.id))
+        .collect();
+    let baseline = Baseline::learn_with_cutoff(&all, cutoff, Some(&incident_event_ids));
     for mut new in correlate(&all, &baseline) {
         let ids: std::collections::HashSet<_> = new.events.iter().map(|e| e.id).collect();
         if let Some(old) = existing

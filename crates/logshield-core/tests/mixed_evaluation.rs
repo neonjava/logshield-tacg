@@ -372,11 +372,11 @@ fn centralized_rules(events: &[SecurityEvent], history: &[SecurityEvent]) -> boo
     false
 }
 fn tacg_alert(events: &[SecurityEvent], history: &[SecurityEvent]) -> (bool, bool) {
-    let mut all = history.to_vec();
-    all.extend_from_slice(events);
-    let baseline = Baseline::learn(&all);
+    // Train baseline EXCLUSIVELY on earlier trusted historical events.
+    // Evaluation events are NEVER passed to Baseline::learn, eliminating baseline leakage.
+    let baseline = Baseline::learn(history);
     let current: HashSet<_> = events.iter().map(|e| e.id).collect();
-    let incidents = correlate(&all, &baseline);
+    let incidents = correlate(events, &baseline);
     let matching: Vec<_> = incidents
         .iter()
         .filter(|i| i.events.iter().any(|e| current.contains(&e.id)))
